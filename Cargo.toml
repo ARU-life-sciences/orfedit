@@ -3,6 +3,20 @@ name = "orfedit"
 version = "0.1.0"
 edition = "2024"
 
+description = """
+orfedit is a command line tool for RNA-editing-aware ORF finding in plant
+organellar (mitochondrial/plastid) genomes - it aligns a gene against a
+codon-hypothesis-tolerant profile, allowing for the C-to-U edits these
+genomes are known to require at start/stop codons and elsewhere.
+"""
+
+license = "MIT"
+documentation = "https://github.com/ARU-life-sciences/orfedit"
+homepage = "https://github.com/ARU-life-sciences/orfedit"
+repository = "https://github.com/ARU-life-sciences/orfedit"
+keywords = ["bioinformatics", "genomics", "rna-editing", "organelle"]
+categories = ["command-line-utilities", "science"]
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
