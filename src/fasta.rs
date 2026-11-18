@@ -97,20 +97,23 @@ pub fn codon_span_to_genomic(
     first_codon: usize,
     last_codon_exclusive: usize,
 ) -> (usize, usize) {
-    // Sense-relative half-open span this alignment covers.
-    let sense_start = frame + first_codon * 3;
-    let sense_end = frame + last_codon_exclusive * 3;
+    sense_span_to_genomic(window_start, window_end, strand, frame + first_codon * 3, frame + last_codon_exclusive * 3)
+}
+
+/// Map a sense-relative half-open span [sense_start, sense_end) of the
+/// window back to absolute genomic 0-based half-open [start, end).
+pub fn sense_span_to_genomic(
+    window_start: usize,
+    window_end: usize,
+    strand: char,
+    sense_start: usize,
+    sense_end: usize,
+) -> (usize, usize) {
     match strand {
         '+' => (window_start + sense_start, window_start + sense_end),
-        _ => {
-            // Sense position p <-> genomic index (window_end - 1 - p); a
-            // sense-forward span [sense_start, sense_end) is a genomic span
-            // that runs backwards, so genomic start = mirror of (sense_end-1),
-            // genomic end = mirror of sense_start, plus one for half-open.
-            let genomic_start = window_end - sense_end;
-            let genomic_end = window_end - sense_start;
-            (genomic_start, genomic_end)
-        }
+        // Sense position p <-> genomic index (window_end - 1 - p), so a
+        // sense-forward span runs backwards on the genome.
+        _ => (window_end - sense_end, window_end - sense_start),
     }
 }
 

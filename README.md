@@ -30,11 +30,15 @@ For one (genomic locus, reference profile) pair:
 
 1. Extract a flanked genomic window around the existing (approximate,
    DNA-level) gene call.
-2. For each of the 3 reading frames, run a semi-global affine-gap DP
-   alignment of the amino acid profile against the window's codons - free
+2. Run a semi-global affine-gap DP alignment of the amino acid profile
+   against the window's codons in all 3 reading frames at once (the DP runs
+   over sense bases; a codon is the 3 bases ending at a position) - free
    end-gaps on the genome side (so the true start/stop can be anywhere in
    the window), full-length required on the profile side (so a real,
-   complete protein is what's being searched for).
+   complete protein is what's being searched for). Between two codons the
+   alignment may also skip 1 or 2 bases, at a cost
+   (`--frameshift-penalty`), moving the rest of the gene into another
+   frame - see Frameshifts below.
 3. At every codon, the substitution score used is the *best* of: translate
    it literally, or translate it with any subset of its C positions
    hypothesized as edited to T, each hypothesized edit costing a small fixed
@@ -65,6 +69,35 @@ cases (`ACG`->`ATG` start rescue, an edited internal stop) plus a
 stability/specificity check (no editing needed -> no change reported).
 `src/lib.rs`'s tests cover the trailing-stop folding above.
 
+## Frameshifts
+
+A frameshifting indel - an assembly error such as a HiFi homopolymer
+miscount, or a real pseudogene - leaves a single-frame alignment able to
+match only one side of it, the rest of the profile deleted. With frame
+changes allowed, the alignment carries on in the new frame and reports
+where it changed: the 1 or 2 skipped bases. Skipping 1 base means the
+gene has one base more than its reading frame wants (a 1-bp insertion, or
+a 2-bp deletion); skipping 2 means one base fewer (a 1-bp deletion, or a
+2-bp insertion). The position is exact to within the codon the indel hit,
+since equal-scoring placements inside a codon can't be told apart.
+
+A frame change is kept only when the protein aligns soundly on both sides
+of it - 10 profile columns each side, at most 2 of them unaligned, the
+rest scoring at least 1.5 on average. Otherwise a truncated or degenerate
+gene copy, with part of the profile left over to align to junk, picks up
+frame changes that only let it score that junk in the best of three
+frames. A gene with any frame change failing this gets its single-frame
+alignment.
+
+`--frameshift-penalty` (default 30) is the cost of one frame change;
+`inf` turns them off. On the DToL plant organelle dataset (90,375 gene
+copies from 2,122 assemblies): with them off, the output is identical to
+0.1.0; with them on, every gene without a frame change is too, 698 genes
+get one, and 1-bp indels planted at random in 900 real genes are found in
+83% (94% of plastid genes, 72% of mito ones - short or partial mito
+copies leave too little profile either side), 99.9% of them with the
+right type and 82% within 3 bp. Runtime is about 8% longer.
+
 ## Output (`scan-batch`)
 
 `<gene-calls-out>`: one row per manifest row - `raw_start`/`raw_end` (echoed
@@ -76,10 +109,15 @@ differ at all" - a profile-alignment boundary essentially never lands on
 the exact same bp as an independently-called boundary even with zero real
 editing, so raw coordinate (in)equality is not a usable "did anything
 biological happen" signal; compare `raw_*`/`corrected_*` yourself if you
-want boundary drift regardless of editing. `<edits-out>`: one row per
+want boundary drift regardless of editing. `n_frameshifts` counts the
+frame changes in the gene, and `frame` is the frame (0-2, within the
+window) of its first aligned codon. `<edits-out>`: one row per
 predicted edit site (genomic position, which profile column - or the
 profile length itself, for a predicted edit-created stop - and the
-resulting amino acid).
+resulting amino acid). `<frameshifts-out>` (optional): one row per
+frame change - `start`/`end` (0-based half-open genomic span of the
+skipped bases), `n_bases` (1 or 2) and `profile_column` (the column after
+it).
 
 ## Profile format
 
@@ -98,6 +136,7 @@ orfedit scan-batch \
   --manifest manifest.tsv \
   --gene-calls-out edited_gene_calls.tsv \
   --edits-out predicted_edits.tsv \
+  --frameshifts-out frameshifts.tsv \
   --threads 16
 ```
 
@@ -107,8 +146,8 @@ orfedit scan-batch \
 DNA-level gene call - `orfedit` extends/corrects outward from there, it
 doesn't discover genes de novo.)
 
-Tunable scoring: `--gap-open`, `--gap-extend`, `--edit-penalty`, and
-`--flank` (bp of genomic context to search around each anchor, default 300).
+Tunable scoring: `--gap-open`, `--gap-extend`, `--edit-penalty`,
+`--frameshift-penalty`, and `--flank` (bp of genomic context to search around each anchor, default 300).
 
 ## Scope
 

@@ -31,6 +31,9 @@ enum Command {
         gene_calls_out: PathBuf,
         #[arg(long)]
         edits_out: PathBuf,
+        /// Also write one row per frameshift found in a corrected gene
+        #[arg(long)]
+        frameshifts_out: Option<PathBuf>,
         #[arg(long, default_value_t = 4)]
         threads: usize,
         #[arg(long, default_value_t = 8.0)]
@@ -41,6 +44,10 @@ enum Command {
         edit_penalty: f64,
         #[arg(long, default_value_t = 300)]
         flank: i64,
+        /// Cost of a frame change (skipping 1 or 2 bases) inside a gene;
+        /// "inf" aligns each gene in a single reading frame
+        #[arg(long, default_value_t = 30.0)]
+        frameshift_penalty: f64,
     },
 }
 
@@ -106,12 +113,24 @@ struct OutRow {
     includes_stop: bool,
     protein: String,
     edits: Vec<(usize, usize, char)>, // genomic_pos, profile_column, resulting_aa
+    frameshifts: Vec<(usize, usize, usize, usize)>, // start, end, n_bases, profile_column
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::ScanBatch { manifest, gene_calls_out, edits_out, threads, gap_open, gap_extend, edit_penalty, flank } => {
+        Command::ScanBatch {
+            manifest,
+            gene_calls_out,
+            edits_out,
+            frameshifts_out,
+            threads,
+            gap_open,
+            gap_extend,
+            edit_penalty,
+            flank,
+            frameshift_penalty,
+        } => {
             rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().ok();
 
             let rows = parse_manifest(&manifest)?;
@@ -138,7 +157,7 @@ fn main() -> Result<()> {
             for r in &rows {
                 groups.entry(r.fasta.clone()).or_default().push(r);
             }
-            let params = ScanParams { gap_open, gap_extend, edit_penalty, flank };
+            let params = ScanParams { gap_open, gap_extend, edit_penalty, flank, frameshift_penalty };
 
             let group_vec: Vec<(&String, &Vec<&ManifestRow>)> = groups.iter().collect();
             let all_results: Vec<OutRow> = group_vec
@@ -184,6 +203,11 @@ fn main() -> Result<()> {
                                     includes_stop: outcome.includes_stop,
                                     protein: outcome.protein,
                                     edits: outcome.edits.into_iter().map(|e| (e.genomic_pos, e.profile_column, e.resulting_aa)).collect(),
+                                    frameshifts: outcome
+                                        .frameshifts
+                                        .into_iter()
+                                        .map(|f| (f.start, f.end, f.n_bases, f.profile_column))
+                                        .collect(),
                                 });
                             }
                             Err(e) => {
@@ -195,11 +219,12 @@ fn main() -> Result<()> {
                 })
                 .collect();
 
-            write_outputs(&gene_calls_out, &edits_out, &all_results)?;
+            write_outputs(&gene_calls_out, &edits_out, frameshifts_out.as_ref(), &all_results)?;
             eprintln!(
-                "[info] orfedit: {} genes scanned, {} corrected -> {}",
+                "[info] orfedit: {} genes scanned, {} corrected, {} with frameshifts -> {}",
                 all_results.len(),
                 all_results.iter().filter(|r| r.changed).count(),
+                all_results.iter().filter(|r| !r.frameshifts.is_empty()).count(),
                 gene_calls_out.display()
             );
             Ok(())
@@ -207,7 +232,12 @@ fn main() -> Result<()> {
     }
 }
 
-fn write_outputs(gene_calls_out: &PathBuf, edits_out: &PathBuf, results: &[OutRow]) -> Result<()> {
+fn write_outputs(
+    gene_calls_out: &PathBuf,
+    edits_out: &PathBuf,
+    frameshifts_out: Option<&PathBuf>,
+    results: &[OutRow],
+) -> Result<()> {
     if let Some(parent) = gene_calls_out.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -218,13 +248,13 @@ fn write_outputs(gene_calls_out: &PathBuf, edits_out: &PathBuf, results: &[OutRo
     let tmp_gc = gene_calls_out.with_extension("tsv.tmp");
     {
         let mut w = String::new();
-        w.push_str("species\torganelle\tgene\tframe\tscore\traw_start\traw_end\tcorrected_start\tcorrected_end\tchanged\tn_edits\tn_columns_aligned\tn_columns_total\tincludes_stop\tprotein\n");
+        w.push_str("species\torganelle\tgene\tframe\tscore\traw_start\traw_end\tcorrected_start\tcorrected_end\tchanged\tn_edits\tn_columns_aligned\tn_columns_total\tincludes_stop\tn_frameshifts\tprotein\n");
         for r in results {
             w.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 r.species, r.organelle, r.gene, r.frame, r.score, r.raw_start, r.raw_end,
                 r.corrected_start, r.corrected_end, r.changed, r.n_edits, r.n_columns_aligned, r.n_columns_total,
-                r.includes_stop, r.protein
+                r.includes_stop, r.frameshifts.len(), r.protein
             ));
         }
         fs::write(&tmp_gc, w)?;
@@ -243,6 +273,25 @@ fn write_outputs(gene_calls_out: &PathBuf, edits_out: &PathBuf, results: &[OutRo
         fs::write(&tmp_ed, w)?;
     }
     fs::rename(&tmp_ed, edits_out)?;
+
+    if let Some(path) = frameshifts_out {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tsv.tmp");
+        let mut w = String::new();
+        w.push_str("species\torganelle\tgene\tstart\tend\tn_bases\tprofile_column\n");
+        for r in results {
+            for (start, end, n_bases, col) in &r.frameshifts {
+                w.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    r.species, r.organelle, r.gene, start, end, n_bases, col
+                ));
+            }
+        }
+        fs::write(&tmp, w)?;
+        fs::rename(&tmp, path)?;
+    }
 
     Ok(())
 }
