@@ -137,6 +137,43 @@ implementation; all three output tables for the 90,375 DToL copies are
 unchanged), in 55 s instead of 6 min 56 s at 16 threads.
 `align::align_nt_frame0_score` gives an alignment's score alone.
 
+## Reverse (U-to-C) editing
+
+Seed plants, mosses and liverworts edit C to U only. Ferns, quillworts
+and hornworts also edit U to C, and heavily: a third of the edits in a
+fern mitochondrion, and nearly half of those turn a genomic stop codon
+into Gln or Arg, about nine stops per gene in Polypodiales. With C-to-U
+alone each such stop is a column the alignment has to skip, or looks like
+the end of the gene.
+
+Two options, both off (`inf`) by default:
+
+- `--stop-edit-penalty`: reading an in-frame TAA or TAG as Gln, or TGA as
+  Arg.
+- `--reverse-edit-penalty`: any other genomic T read as C.
+
+They are separate because a stop inside a gene is strong evidence of an
+edit and an ordinary T is not. Measured on 702 single-exon mito gene
+copies from 30 DToL fern assemblies, against 4,380 copies from 60
+angiosperm assemblies in which any U-to-C call is false:
+
+- `--stop-edit-penalty 2.5` (the cost of a C-to-U edit): fern copies
+  aligned over 99% of their profile go from 152 to 292, frameshift calls
+  from 277 to 113, and U-to-C comes to 32% of mito and 6% of plastid
+  edits - 33-35% and 1-10% are measured in fern transcriptomes. At 4 and
+  6 fewer copies align (289, 285).
+- Adding `--reverse-edit-penalty` 8 or 12 changes nothing for the ferns.
+  One flat cost of 2.5 for every reverse edit gives the same 292 but
+  calls U-to-C for 55% of fern mito edits and puts two false ones in
+  every angiosperm gene copy.
+- In the angiosperm copies, stop read-through at 2.5 changes 461
+  proteins: stops in truncated or pseudogene copies read through. It is
+  for lineages that edit this way, not a safe default.
+
+With either option off the output is what it was (every table for 90,102
+DToL gene copies unchanged). The edits table has an `edit` column, `C>U`
+or `U>C`.
+
 ## Output (`scan-batch`)
 
 `<gene-calls-out>`: one row per manifest row - `raw_start`/`raw_end` (echoed
@@ -186,7 +223,7 @@ DNA-level gene call - `orfedit` extends/corrects outward from there, it
 doesn't discover genes de novo.)
 
 Tunable scoring: `--gap-open`, `--gap-extend`, `--edit-penalty`,
-`--frameshift-penalty`, `--stop-search`, and `--flank` (bp of genomic context to search around each anchor, default 300).
+`--frameshift-penalty`, `--stop-search`, `--stop-edit-penalty`, `--reverse-edit-penalty`, and `--flank` (bp of genomic context to search around each anchor, default 300).
 
 ## Scope
 

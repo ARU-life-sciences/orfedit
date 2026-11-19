@@ -10,7 +10,7 @@
 //! sense codon resolve as an edited stop, or a genomic near-start resolve as
 //! an edited ATG, whichever the reference profile supports better.
 
-use crate::codon::codon_hypotheses;
+use crate::codon::{codon_hypotheses, codon_hypotheses_reverse, EditCosts};
 use crate::profile::Profile;
 
 const NEG_INF: f64 = f64::NEG_INFINITY;
@@ -46,12 +46,24 @@ pub struct AlignResult {
     pub codon_span: Option<(usize, usize)>,
 }
 
-fn best_hypothesis_score(profile: &Profile, col: usize, codon: [u8; 3], edit_penalty: f64) -> (f64, u8, u8, u8) {
+/// The best reading of `codon` against profile column `col`: (score, amino
+/// acid, number of edits either way, mask of edited positions). C->U
+/// readings first, so that without reverse editing - and on a tie with it -
+/// the result is what it always was.
+fn best_hypothesis_score(profile: &Profile, col: usize, codon: [u8; 3], edit_penalty: EditCosts) -> (f64, u8, u8, u8) {
     let mut best = (NEG_INF, b'X', 0u8, 0u8);
     for h in codon_hypotheses(codon) {
-        let s = profile.score(col, h.aa) - edit_penalty * h.n_edits as f64;
+        let s = profile.score(col, h.aa) - edit_penalty.cost(h.n_edits, 0, 0);
         if s > best.0 {
             best = (s, h.aa, h.n_edits, h.edit_mask);
+        }
+    }
+    if edit_penalty.reverse() {
+        for h in codon_hypotheses_reverse(codon) {
+            let s = profile.score(col, h.aa) - edit_penalty.cost(h.n_edits, h.n_rev, h.n_stop);
+            if s > best.0 {
+                best = (s, h.aa, h.n_edits + h.n_rev + h.n_stop, h.edit_mask);
+            }
         }
     }
     best
@@ -73,17 +85,22 @@ fn base_class(b: u8) -> usize {
 const N_CODON_CLASSES: usize = 125;
 
 /// For each of the 125 codon classes, its edit hypotheses as
-/// (index into AA_ORDER or None, n_edits), in `codon_hypotheses` order.
-fn codon_class_hypotheses() -> &'static Vec<Vec<(Option<usize>, u8)>> {
-    static TABLE: std::sync::OnceLock<Vec<Vec<(Option<usize>, u8)>>> = std::sync::OnceLock::new();
+/// (index into AA_ORDER or None, C->U edits, U->C edits, stop
+/// read-throughs): the C->U readings in `codon_hypotheses` order, then the
+/// reverse ones.
+type ClassReading = (Option<usize>, u8, u8, u8);
+type ClassHypotheses = (Vec<ClassReading>, Vec<ClassReading>);
+fn codon_class_hypotheses() -> &'static Vec<ClassHypotheses> {
+    static TABLE: std::sync::OnceLock<Vec<ClassHypotheses>> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         const REP: [u8; 5] = *b"ACGTN";
         (0..N_CODON_CLASSES)
             .map(|c| {
-                codon_hypotheses([REP[c / 25], REP[(c / 5) % 5], REP[c % 5]])
-                    .into_iter()
-                    .map(|h| (crate::codon::aa_index(h.aa), h.n_edits))
-                    .collect()
+                let codon = [REP[c / 25], REP[(c / 5) % 5], REP[c % 5]];
+                let pack = |hyps: Vec<crate::codon::CodonHypothesis>| {
+                    hyps.into_iter().map(|h| (crate::codon::aa_index(h.aa), h.n_edits, h.n_rev, h.n_stop)).collect::<Vec<_>>()
+                };
+                (pack(codon_hypotheses(codon)), pack(codon_hypotheses_reverse(codon)))
             })
             .collect()
     })
@@ -94,18 +111,20 @@ fn codon_class_hypotheses() -> &'static Vec<Vec<(Option<usize>, u8)>> {
 /// arithmetic in the same order as `best_hypothesis_score`, so the values
 /// are bit-identical; the DP then does one lookup per cell instead of
 /// enumerating (and heap-allocating) the hypotheses each time.
-fn hypothesis_score_table(profile: &Profile, edit_penalty: f64) -> Vec<f64> {
+fn hypothesis_score_table(profile: &Profile, edit_penalty: EditCosts) -> Vec<f64> {
     let hyps = codon_class_hypotheses();
+    let reverse = edit_penalty.reverse();
     let mut table = Vec::with_capacity(profile.len() * N_CODON_CLASSES);
     for col in &profile.columns {
-        for class in hyps {
+        for (forward, backward) in hyps {
             let mut best = NEG_INF;
-            for &(aa_idx, n_edits) in class {
+            let readings = forward.iter().chain(backward.iter().filter(|_| reverse));
+            for &(aa_idx, n_edits, n_rev, n_stop) in readings {
                 let base = match aa_idx {
                     Some(a) => col[a],
                     None => NEG_INF,
                 };
-                let s = base - edit_penalty * n_edits as f64;
+                let s = base - edit_penalty.cost(n_edits, n_rev, n_stop);
                 if s > best {
                     best = s;
                 }
@@ -132,8 +151,9 @@ pub fn align(
     codons: &[[u8; 3]],
     gap_open: f64,
     gap_extend: f64,
-    edit_penalty: f64,
+    edit_penalty: impl Into<EditCosts>,
 ) -> AlignResult {
+    let edit_penalty: EditCosts = edit_penalty.into();
     let l = profile.len();
     let m = codons.len();
     let w = m + 1;
@@ -311,8 +331,9 @@ fn frameshift_window(
     sense_seq: &[u8],
     columns: &[NtColumnCall],
     c: usize,
-    edit_penalty: f64,
+    edit_penalty: impl Into<EditCosts>,
 ) -> Option<(usize, usize)> {
+    let edit_penalty: EditCosts = edit_penalty.into();
     let start_of = |j: usize| match columns.get(j) {
         Some(NtColumnCall::Aligned { sense_start, .. }) => Some(*sense_start),
         _ => None,
@@ -402,9 +423,10 @@ pub fn align_nt(
     sense_seq: &[u8],
     gap_open: f64,
     gap_extend: f64,
-    edit_penalty: f64,
+    edit_penalty: impl Into<EditCosts>,
     frameshift_penalty: f64,
 ) -> NtAlignResult {
+    let edit_penalty: EditCosts = edit_penalty.into();
     align_nt_from(profile, sense_seq, gap_open, gap_extend, edit_penalty, frameshift_penalty, true)
 }
 
@@ -416,9 +438,10 @@ pub fn align_nt_frame0(
     sense_seq: &[u8],
     gap_open: f64,
     gap_extend: f64,
-    edit_penalty: f64,
+    edit_penalty: impl Into<EditCosts>,
     frameshift_penalty: f64,
 ) -> NtAlignResult {
+    let edit_penalty: EditCosts = edit_penalty.into();
     align_nt_from(profile, sense_seq, gap_open, gap_extend, edit_penalty, frameshift_penalty, false)
 }
 
@@ -437,10 +460,11 @@ fn align_nt_from(
     sense_seq: &[u8],
     gap_open: f64,
     gap_extend: f64,
-    edit_penalty: f64,
+    edit_penalty: impl Into<EditCosts>,
     frameshift_penalty: f64,
     any_frame: bool,
 ) -> NtAlignResult {
+    let edit_penalty: EditCosts = edit_penalty.into();
     align_nt_impl(profile, sense_seq, gap_open, gap_extend, edit_penalty, frameshift_penalty, any_frame, TWO_PASS_MIN_CELLS)
 }
 
@@ -619,11 +643,12 @@ fn align_nt_impl(
     sense_seq: &[u8],
     gap_open: f64,
     gap_extend: f64,
-    edit_penalty: f64,
+    edit_penalty: impl Into<EditCosts>,
     frameshift_penalty: f64,
     any_frame: bool,
     two_pass_min_cells: usize,
 ) -> NtAlignResult {
+    let edit_penalty: EditCosts = edit_penalty.into();
     let l = profile.len();
     let n = sense_seq.len();
     if l == 0 {
@@ -818,9 +843,10 @@ pub fn align_nt_frame0_score(
     sense_seq: &[u8],
     gap_open: f64,
     gap_extend: f64,
-    edit_penalty: f64,
+    edit_penalty: impl Into<EditCosts>,
     frameshift_penalty: f64,
 ) -> f64 {
+    let edit_penalty: EditCosts = edit_penalty.into();
     if profile.is_empty() {
         return 0.0;
     }
@@ -835,10 +861,11 @@ fn align_nt_from_reference(
     sense_seq: &[u8],
     gap_open: f64,
     gap_extend: f64,
-    edit_penalty: f64,
+    edit_penalty: impl Into<EditCosts>,
     frameshift_penalty: f64,
     any_frame: bool,
 ) -> NtAlignResult {
+    let edit_penalty: EditCosts = edit_penalty.into();
     let l = profile.len();
     let n = sense_seq.len();
     let w = n + 1;
@@ -1251,6 +1278,44 @@ mod tests {
         assert!(f.window.0 <= f.sense_pos && f.sense_pos + 1 <= f.window.1);
         // any of the 10 As can be the extra one
         assert_eq!(f.window, (run_start, run_end), "window {:?}", f.window);
+    }
+
+    #[test]
+    fn reverse_editing_dp_matches_the_reference_implementation() {
+        // the score table and the per-codon enumeration must agree with
+        // U->C readings in play too, in one pass and in two
+        let costs = EditCosts { c_to_u: 2.5, u_to_c: 3.0, u_to_c_stop: 2.0 };
+        let mut rng = Lcg(11);
+        let mut n_rev = 0;
+        for trial in 0..200 {
+            let n_codons = 5 + (rng.next() % 40) as usize;
+            let (mut seq, profile) = random_gene(&mut rng, n_codons);
+            // turn some C into T, as a genome awaiting U->C edits would have
+            for i in 0..seq.len() {
+                if seq[i] == b'C' && rng.next() % 4 == 0 {
+                    seq[i] = b'T';
+                }
+            }
+            let n_junk = (rng.next() % 100) as usize;
+            let mut full = random_dna(&mut rng, n_junk);
+            full.extend(&seq);
+            full.extend(random_dna(&mut rng, n_junk));
+            for penalty in [f64::INFINITY, 20.0] {
+                for any_frame in [true, false] {
+                    let b = align_nt_from_reference(&profile, &full, 8.0, 1.0, costs, penalty, any_frame);
+                    for two_pass_min_cells in [usize::MAX, 0] {
+                        let a = align_nt_impl(&profile, &full, 8.0, 1.0, costs, penalty, any_frame, two_pass_min_cells);
+                        assert_eq!(a.score.to_bits(), b.score.to_bits(), "score, trial {trial}");
+                        assert_eq!(format!("{:?}", a.columns), format!("{:?}", b.columns), "columns, trial {trial}");
+                    }
+                    // and it never scores below C->U editing alone
+                    let plain = align_nt_from_reference(&profile, &full, 8.0, 1.0, 2.5, penalty, any_frame);
+                    assert!(b.score >= plain.score, "trial {trial}");
+                    n_rev += (b.score > plain.score) as usize;
+                }
+            }
+        }
+        assert!(n_rev > 50, "reverse editing should matter in this test ({n_rev})");
     }
 
     #[test]

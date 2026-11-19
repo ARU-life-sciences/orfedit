@@ -42,6 +42,16 @@ enum Command {
         gap_extend: f64,
         #[arg(long, default_value_t = 2.5)]
         edit_penalty: f64,
+        /// Cost of a U-to-C ("reverse") RNA edit other than a stop
+        /// read-through. `inf`, the default: none, as in seed plants,
+        /// mosses, liverworts, horsetails and most lycophytes. Ferns,
+        /// quillworts and hornworts edit both ways
+        #[arg(long, default_value_t = f64::INFINITY)]
+        reverse_edit_penalty: f64,
+        /// Cost of reading a genomic in-frame TAA or TAG as Gln, or TGA as
+        /// Arg, by a U-to-C edit. `inf`, the default: a stop is a stop
+        #[arg(long, default_value_t = f64::INFINITY)]
+        stop_edit_penalty: f64,
         #[arg(long, default_value_t = 300)]
         flank: i64,
         /// Cost of a frame change (skipping 1 or 2 bases) inside a gene;
@@ -131,7 +141,7 @@ struct OutRow {
     n_columns_total: usize,
     includes_stop: bool,
     protein: String,
-    edits: Vec<(usize, usize, char)>, // genomic_pos, profile_column, resulting_aa
+    edits: Vec<(usize, usize, char, bool)>, // genomic_pos, profile_column, resulting_aa, reverse
     frameshifts: Vec<(usize, usize, usize, usize, usize, usize)>, // start, end, n_bases, profile_column, window
 }
 
@@ -147,6 +157,8 @@ fn main() -> Result<()> {
             gap_open,
             gap_extend,
             edit_penalty,
+            reverse_edit_penalty,
+            stop_edit_penalty,
             flank,
             frameshift_penalty,
             frameshift_flank,
@@ -185,6 +197,8 @@ fn main() -> Result<()> {
                 gap_open,
                 gap_extend,
                 edit_penalty,
+                reverse_edit_penalty,
+                stop_edit_penalty,
                 flank,
                 frameshift_penalty,
                 frameshift_flank,
@@ -237,7 +251,7 @@ fn main() -> Result<()> {
                                     n_columns_total: outcome.n_columns_total,
                                     includes_stop: outcome.includes_stop,
                                     protein: outcome.protein,
-                                    edits: outcome.edits.into_iter().map(|e| (e.genomic_pos, e.profile_column, e.resulting_aa)).collect(),
+                                    edits: outcome.edits.into_iter().map(|e| (e.genomic_pos, e.profile_column, e.resulting_aa, e.reverse)).collect(),
                                     frameshifts: outcome
                                         .frameshifts
                                         .into_iter()
@@ -299,10 +313,11 @@ fn write_outputs(
     let tmp_ed = edits_out.with_extension("tsv.tmp");
     {
         let mut w = String::new();
-        w.push_str("species\torganelle\tgene\tgenomic_pos\tprofile_column\tresulting_aa\n");
+        w.push_str("species\torganelle\tgene\tgenomic_pos\tprofile_column\tresulting_aa\tedit\n");
         for r in results {
-            for (pos, col, aa) in &r.edits {
-                w.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\n", r.species, r.organelle, r.gene, pos, col, aa));
+            for (pos, col, aa, reverse) in &r.edits {
+                let kind = if *reverse { "U>C" } else { "C>U" };
+                w.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\n", r.species, r.organelle, r.gene, pos, col, aa, kind));
             }
         }
         fs::write(&tmp_ed, w)?;

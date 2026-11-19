@@ -13,6 +13,9 @@ pub struct EditCall {
     pub genomic_pos: usize,
     pub profile_column: usize, // 0-indexed
     pub resulting_aa: char,
+    /// A U->C edit (the genome has T, the transcript reads C); false for
+    /// the usual C->U.
+    pub reverse: bool,
 }
 
 /// A frameshift in the corrected gene: genomic 0-based half-open
@@ -87,6 +90,13 @@ pub const FRAMESHIFT_MIN_GAIN: f64 = 0.0;
 
 /// Whether every frame change in `result` has sound alignment both sides
 /// (always, with `params.frameshift_flank` 0).
+impl ScanParams {
+    /// The edit costs these parameters ask for.
+    pub fn edit_costs(&self) -> codon::EditCosts {
+        codon::EditCosts { c_to_u: self.edit_penalty, u_to_c: self.reverse_edit_penalty, u_to_c_stop: self.stop_edit_penalty }
+    }
+}
+
 pub fn frameshifts_supported(profile: &Profile, result: &align::NtAlignResult, params: &ScanParams) -> bool {
     let n = result.columns.len();
     let k = params.frameshift_flank;
@@ -140,6 +150,15 @@ pub struct ScanParams {
     /// training calls), which left the corrected gene those codons and the
     /// stop short.
     pub stop_search: usize,
+    /// Cost of a U->C ("reverse") edit that is not a stop read-through;
+    /// infinite (the default) for none. Ferns, some lycophytes and
+    /// hornworts edit both ways.
+    pub reverse_edit_penalty: f64,
+    /// Cost of reading a genomic in-frame stop codon as a residue by a
+    /// U->C edit (TAA, TAG -> Gln; TGA -> Arg); infinite (the default) for
+    /// none. Kept apart from `reverse_edit_penalty` because a stop inside
+    /// a gene is far stronger evidence of an edit than any other T.
+    pub stop_edit_penalty: f64,
 }
 
 impl Default for ScanParams {
@@ -155,6 +174,8 @@ impl Default for ScanParams {
             frameshift_min_flank_score: FRAMESHIFT_MIN_FLANK_SCORE,
             frameshift_min_gain: FRAMESHIFT_MIN_GAIN,
             stop_search: 0,
+            reverse_edit_penalty: f64::INFINITY,
+            stop_edit_penalty: f64::INFINITY,
         }
     }
 }
@@ -184,12 +205,12 @@ pub fn scan_gene(
         &sense_seq,
         params.gap_open,
         params.gap_extend,
-        params.edit_penalty,
+        params.edit_costs(),
         params.frameshift_penalty,
     );
     let filtering = params.frameshift_min_gain > 0.0 || params.frameshift_flank > 0;
     if filtering && !result.frameshifts.is_empty() {
-        let single = align::align_nt(profile, &sense_seq, params.gap_open, params.gap_extend, params.edit_penalty, f64::INFINITY);
+        let single = align::align_nt(profile, &sense_seq, params.gap_open, params.gap_extend, params.edit_costs(), f64::INFINITY);
         if result.score - single.score < params.frameshift_min_gain || !frameshifts_supported(profile, &result, params) {
             result = single;
         }
@@ -215,7 +236,9 @@ pub fn scan_gene(
                         if edit_mask & (1 << bit) != 0 {
                             let sense_pos = sense_start + bit as usize;
                             let genomic_pos = sense_base_to_genomic(window_start, window_end, strand, sense_pos);
-                            edits.push(EditCall { genomic_pos, profile_column: col_idx, resulting_aa: *aa as char });
+                            // the genome's base says which way: a C was read as U, a T as C
+                            let reverse = sense_seq[sense_pos] == b'T';
+                            edits.push(EditCall { genomic_pos, profile_column: col_idx, resulting_aa: *aa as char, reverse });
                         }
                     }
                 }
@@ -255,7 +278,7 @@ pub fn scan_gene(
                         if hyp.edit_mask & (1 << bit) != 0 {
                             let sense_pos = sense_end + bit as usize;
                             let genomic_pos = sense_base_to_genomic(window_start, window_end, strand, sense_pos);
-                            edits.push(EditCall { genomic_pos, profile_column: result.columns.len(), resulting_aa: '*' });
+                            edits.push(EditCall { genomic_pos, profile_column: result.columns.len(), resulting_aa: '*', reverse: false });
                         }
                     }
                 }
@@ -398,6 +421,43 @@ mod tests {
         let params = ScanParams { stop_search: 2, ..params };
         let out = scan_gene(&idx, "ctg", 12, 21, '-', &profile, &params).unwrap();
         assert_eq!((out.includes_stop, out.corrected_start, out.corrected_end), (true, 3, 21));
+    }
+
+    fn one_residue_profile(residues: &[u8]) -> Profile {
+        let mut columns = Vec::new();
+        for &target in residues {
+            let mut col = [-5.0f64; 20];
+            col[AA_ORDER.iter().position(|&x| x == target).unwrap()] = 5.0;
+            columns.push(col);
+        }
+        Profile { gene: "test".to_string(), columns }
+    }
+
+    #[test]
+    fn reverse_editing_reads_an_in_frame_stop_as_a_residue() {
+        // profile M K Q V F: the genome has TAA where the protein has Gln
+        let profile = one_residue_profile(b"MKQVF");
+        let idx = fasta_with("ctg", "GGGATGAAATAAGTTTTTTAGGGG");
+        let params = ScanParams { flank: 3, ..ScanParams::default() };
+        // C->U only: the stop can't be a residue, so its column is skipped
+        let out = scan_gene(&idx, "ctg", 3, 18, '+', &profile, &params).unwrap();
+        assert_ne!(out.protein, "MKQVF");
+        assert!(out.edits.iter().all(|e| !e.reverse));
+        // stop read-through alone is enough: TAA -> CAA, one U->C edit at the T
+        let params = ScanParams { stop_edit_penalty: 2.5, ..params };
+        let out = scan_gene(&idx, "ctg", 3, 18, '+', &profile, &params).unwrap();
+        assert_eq!(out.protein, "MKQVF");
+        assert_eq!(out.edits.len(), 1);
+        assert_eq!((out.edits[0].genomic_pos, out.edits[0].resulting_aa, out.edits[0].reverse), (9, 'Q', true));
+        // the literal stop after the last residue is still the gene's end
+        assert!(out.includes_stop);
+        assert_eq!((out.corrected_start, out.corrected_end), (3, 21));
+        // minus strand: the same gene reverse-complemented
+        let idx = fasta_with("ctg", "CCCCTAAAAAACTTATTTCATCCC");
+        let out = scan_gene(&idx, "ctg", 6, 21, '-', &profile, &params).unwrap();
+        assert_eq!(out.protein, "MKQVF");
+        assert_eq!((out.edits.len(), out.edits[0].genomic_pos, out.edits[0].reverse), (1, 14, true));
+        assert_eq!((out.corrected_start, out.corrected_end), (3, 21));
     }
 
     #[test]
