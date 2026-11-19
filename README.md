@@ -78,25 +78,41 @@ changes allowed, the alignment carries on in the new frame and reports
 where it changed: the 1 or 2 skipped bases. Skipping 1 base means the
 gene has one base more than its reading frame wants (a 1-bp insertion, or
 a 2-bp deletion); skipping 2 means one base fewer (a 1-bp deletion, or a
-2-bp insertion). The position is exact to within the codon the indel hit,
-since equal-scoring placements inside a codon can't be told apart.
+2-bp insertion).
 
-A frame change is kept only when the protein aligns soundly on both sides
-of it - 10 profile columns each side, at most 2 of them unaligned, the
-rest scoring at least 1.5 on average. Otherwise a truncated or degenerate
-gene copy, with part of the profile left over to align to junk, picks up
-frame changes that only let it score that junk in the best of three
-frames. A gene with any frame change failing this gets its single-frame
-alignment.
+Where the change could equally well sit is often wider than the skipped
+bases - anywhere in a homopolymer run, or along a stretch both frames
+read about as well - so each frame change also gets a **window**: every
+breakpoint within the ungapped 30 columns either side whose score comes
+within 2 of the best one. The extra A in `GTT AAAAAAAAAA TGG` gets the
+whole run.
 
-`--frameshift-penalty` (default 30) is the cost of one frame change;
-`inf` turns them off. On the DToL plant organelle dataset (90,375 gene
-copies from 2,122 assemblies): with them off, the output is identical to
-0.1.0; with them on, every gene without a frame change is too, 698 genes
-get one, and 1-bp indels planted at random in 900 real genes are found in
-83% (94% of plastid genes, 72% of mito ones - short or partial mito
-copies leave too little profile either side), 99.9% of them with the
-right type and 82% within 3 bp. Runtime is about 8% longer.
+`--frameshift-penalty` (default 20) is the cost of one frame change;
+`inf` turns them off and gives exactly the 0.1 result. Two optional
+filters revert a gene to its single-frame alignment: `--frameshift-flank`
+(> 0: that many soundly aligned profile columns needed each side, with
+`--frameshift-max-deleted` / `--frameshift-min-flank-score`) and
+`--frameshift-min-gain` (the frame changes must beat the best single
+frame by that much). Both are off: they mostly remove calls in partial
+gene copies and ones that recur across assemblies, and cost recall.
+
+Validation on the DToL plant organelle dataset (90,375 gene copies from
+2,122 assemblies; `poa`'s `build/fs_val` scripts):
+
+- Frame changes off: output identical to 0.1.0. On: every gene without a
+  frame change is aligned exactly as with them off.
+- 1,500 1-bp indels planted at random in the coding sequence of real gene
+  copies are found (at the indel, or with it inside the window) in 92%:
+  96% in plastid genes, 88% in mito ones, 94% in genes' best copies
+  aligning 90% or more of the profile; 99.4% with the right type. The
+  misses are mostly short genes (rps19, atp9, rps14) and indels near a
+  gene end, where too little profile is left on one side to pay for a
+  frame change.
+- Across the dataset, a mean of 2 calls per assembly (median 1); 79 calls
+  in a gene's best copy at a place no other assembly has one - the
+  candidates for assembly errors.
+- Penalty 30 instead: 90% found, a mean of 1.1 calls per assembly.
+  The 10/2/1.5 flank filter at penalty 30: 81% found.
 
 ## Output (`scan-batch`)
 
@@ -116,8 +132,8 @@ predicted edit site (genomic position, which profile column - or the
 profile length itself, for a predicted edit-created stop - and the
 resulting amino acid). `<frameshifts-out>` (optional): one row per
 frame change - `start`/`end` (0-based half-open genomic span of the
-skipped bases), `n_bases` (1 or 2) and `profile_column` (the column after
-it).
+skipped bases), `n_bases` (1 or 2), `profile_column` (the column after
+it) and `window_start`/`window_end` (the window, containing start/end).
 
 ## Profile format
 

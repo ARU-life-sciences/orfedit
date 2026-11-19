@@ -219,6 +219,75 @@ pub struct Frameshift {
     pub sense_pos: usize,
     pub n_bases: usize,
     pub after_column: usize,
+    /// Sense-relative half-open [start, end) over which the frame change
+    /// could equally well sit: moving it to any column boundary within
+    /// the ungapped stretch either side (FRAMESHIFT_WINDOW_COLUMNS) that
+    /// scores within FRAMESHIFT_WINDOW_TOLERANCE of the best placement.
+    /// Where both frames read about as well as each other (a divergent
+    /// stretch), that's wider than the bases skipped.
+    pub window: (usize, usize),
+}
+
+/// How many aligned columns either side of a frame change are tried as
+/// its other possible placements, and how close (score) to the best one
+/// such a placement must come to widen the window.
+pub const FRAMESHIFT_WINDOW_COLUMNS: usize = 30;
+pub const FRAMESHIFT_WINDOW_TOLERANCE: f64 = 2.0;
+
+/// The window (see `Frameshift::window`) of the frame change between
+/// columns `c - 1` and `c`: within the ungapped run of consecutive codons
+/// on each side, score every breakpoint k (columns before k read in the
+/// upstream frame, from k on in the downstream one).
+fn frameshift_window(
+    profile: &Profile,
+    sense_seq: &[u8],
+    columns: &[NtColumnCall],
+    c: usize,
+    edit_penalty: f64,
+) -> Option<(usize, usize)> {
+    let start_of = |j: usize| match columns.get(j) {
+        Some(NtColumnCall::Aligned { sense_start, .. }) => Some(*sense_start),
+        _ => None,
+    };
+    let (a0, b0) = (start_of(c - 1)?, start_of(c)?); // the codons either side
+    // the run of consecutive codons in each frame
+    let mut lo = c - 1;
+    while lo > 0 && c - lo < FRAMESHIFT_WINDOW_COLUMNS && start_of(lo - 1).is_some_and(|s| s + 3 == start_of(lo).unwrap()) {
+        lo -= 1;
+    }
+    let mut hi = c;
+    while hi + 1 < columns.len()
+        && hi + 1 - c < FRAMESHIFT_WINDOW_COLUMNS
+        && start_of(hi + 1).is_some_and(|s| s == start_of(hi).unwrap() + 3)
+    {
+        hi += 1;
+    }
+    // codon start of column j read in frame A (upstream) or B (downstream)
+    let in_a = |j: usize| (a0 as i64 + 3 * (j as i64 - (c as i64 - 1))) as usize;
+    let in_b = |j: usize| b0 as i64 + 3 * (j as i64 - c as i64);
+    let score = |j: usize, s: i64| -> f64 {
+        if s < 0 || s as usize + 3 > sense_seq.len() {
+            return NEG_INF;
+        }
+        let s = s as usize;
+        best_hypothesis_score(profile, j, [sense_seq[s], sense_seq[s + 1], sense_seq[s + 2]], edit_penalty).0
+    };
+    // breakpoints k in lo+1..=hi: columns lo..k in A, k..=hi in B
+    let mut scores = Vec::new();
+    for k in lo + 1..=hi {
+        let a: f64 = (lo..k).map(|j| score(j, in_a(j) as i64)).sum();
+        let b: f64 = (k..=hi).map(|j| score(j, in_b(j))).sum();
+        scores.push((k, a + b));
+    }
+    let best = scores.iter().map(|x| x.1).fold(NEG_INF, f64::max);
+    if !best.is_finite() {
+        return None;
+    }
+    let near: Vec<usize> = scores.iter().filter(|x| x.1 >= best - FRAMESHIFT_WINDOW_TOLERANCE).map(|x| x.0).collect();
+    // bases between the last upstream codon and the first downstream one
+    let start = near.iter().map(|&k| in_a(k - 1) + 3).min()?;
+    let end = near.iter().map(|&k| in_b(k).max(0) as usize).max()?;
+    Some((start.min(end), end.max(start)))
 }
 
 /// One profile column's outcome in a nucleotide-level alignment: like
@@ -267,6 +336,32 @@ pub fn align_nt(
     edit_penalty: f64,
     frameshift_penalty: f64,
 ) -> NtAlignResult {
+    align_nt_from(profile, sense_seq, gap_open, gap_extend, edit_penalty, frameshift_penalty, true)
+}
+
+/// `align_nt` with the alignment starting in frame 0 of `sense_seq` (a
+/// sequence already in frame, such as joined exons): with
+/// `frameshift_penalty` infinite this is `align` over frame 0's codons.
+pub fn align_nt_frame0(
+    profile: &Profile,
+    sense_seq: &[u8],
+    gap_open: f64,
+    gap_extend: f64,
+    edit_penalty: f64,
+    frameshift_penalty: f64,
+) -> NtAlignResult {
+    align_nt_from(profile, sense_seq, gap_open, gap_extend, edit_penalty, frameshift_penalty, false)
+}
+
+fn align_nt_from(
+    profile: &Profile,
+    sense_seq: &[u8],
+    gap_open: f64,
+    gap_extend: f64,
+    edit_penalty: f64,
+    frameshift_penalty: f64,
+    any_frame: bool,
+) -> NtAlignResult {
     let l = profile.len();
     let n = sense_seq.len();
     let w = n + 1;
@@ -276,9 +371,14 @@ pub fn align_nt(
 
     // Scores roll over two profile rows; pointers are kept for traceback.
     let mut prev_m = vec![NEG_INF; w];
-    let mut prev_ex = vec![0.0f64; w]; // free leading skip, any frame
+    let mut prev_ex = vec![NEG_INF; w];
     let mut prev_ey = vec![NEG_INF; w];
-    for p in 0..w.min(3) {
+    for p in 0..w {
+        if any_frame || p % 3 == 0 {
+            prev_ex[p] = 0.0; // free leading skip
+        }
+    }
+    for p in 0..w.min(if any_frame { 3 } else { 1 }) {
         prev_m[p] = 0.0; // each frame's alignment may start at its own first base
     }
     let mut cur_m = vec![NEG_INF; w];
@@ -398,7 +498,7 @@ pub fn align_nt(
                 NtPtr::FromEx => p -= 3,
                 tag @ (NtPtr::Shift1 | NtPtr::Shift2) => {
                     let d = if tag == NtPtr::Shift1 { 1 } else { 2 };
-                    frameshifts.push(Frameshift { sense_pos: p - d, n_bases: d, after_column: i });
+                    frameshifts.push(Frameshift { sense_pos: p - d, n_bases: d, after_column: i, window: (p - d, p) });
                     p -= d;
                     cur = NtPtr::FromM;
                 }
@@ -409,6 +509,11 @@ pub fn align_nt(
     }
     columns.reverse();
     frameshifts.reverse();
+    for f in frameshifts.iter_mut() {
+        if let Some((s, e)) = frameshift_window(profile, sense_seq, &columns, f.after_column, edit_penalty) {
+            f.window = (s.min(f.sense_pos), e.max(f.sense_pos + f.n_bases));
+        }
+    }
     let sense_span = match (first, last) {
         (Some(f), Some(la)) => Some((f, la)),
         _ => None,
@@ -624,5 +729,50 @@ mod tests {
             assert!(r.frameshifts.is_empty());
             assert_eq!(r.sense_span, Some((50, 50 + gene.len())));
         }
+    }
+
+    #[test]
+    fn frame0_alignment_without_shifts_is_align_over_frame0() {
+        let mut rng = Lcg(23);
+        for _ in 0..30 {
+            let n_codons = 20 + (rng.next() % 20) as usize;
+            let (gene, mut profile) = random_gene(&mut rng, n_codons);
+            for col in profile.columns.iter_mut() {
+                col[(rng.next() % 20) as usize] += 3.0;
+            }
+            let lead = (rng.next() % 40) as usize;
+            let mut seq = random_dna(&mut rng, lead);
+            seq.extend_from_slice(&gene);
+            let codons: Vec<[u8; 3]> = seq.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+            let r = align(&profile, &codons, 8.0, 1.0, 2.5);
+            let nt = align_nt_frame0(&profile, &seq, 8.0, 1.0, 2.5, f64::INFINITY);
+            assert!((nt.score - r.score).abs() < 1e-9);
+            assert_eq!(nt.sense_span, r.codon_span.map(|(a, b)| (3 * a, 3 * b)));
+        }
+    }
+
+    #[test]
+    fn homopolymer_insertion_gets_the_whole_run_as_its_window() {
+        // (MVWFE)x4 + V KKK W + (MVWFE)x4, with one extra A in the AAAAAAAAA run
+        let flank = "ATGGTTTGGTTTGAA".repeat(4);
+        let mut seq = String::from("CCC");
+        seq += &flank;
+        seq += "GTT"; // V   sense 63..66
+        let run_start = seq.len();
+        seq += "AAAAAAAAAA"; // KKK + the extra A
+        let run_end = seq.len();
+        seq += "TGG"; // W
+        seq += &flank;
+        let mut aas = b"MVWFE".repeat(4);
+        aas.extend_from_slice(b"VKKKW");
+        aas.extend(b"MVWFE".repeat(4));
+        let profile = single_aa_profile("t", &aas);
+        let r = align_nt(&profile, seq.as_bytes(), 8.0, 1.0, 2.5, 10.0);
+        assert_eq!(r.frameshifts.len(), 1);
+        let f = &r.frameshifts[0];
+        assert_eq!(f.n_bases, 1);
+        assert!(f.window.0 <= f.sense_pos && f.sense_pos + 1 <= f.window.1);
+        // any of the 10 As can be the extra one
+        assert_eq!(f.window, (run_start, run_end), "window {:?}", f.window);
     }
 }

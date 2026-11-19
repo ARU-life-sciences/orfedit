@@ -46,8 +46,22 @@ enum Command {
         flank: i64,
         /// Cost of a frame change (skipping 1 or 2 bases) inside a gene;
         /// "inf" aligns each gene in a single reading frame
-        #[arg(long, default_value_t = 30.0)]
+        #[arg(long, default_value_t = 20.0)]
         frameshift_penalty: f64,
+        /// Profile columns each side of a frame change that must align
+        /// soundly for it to be kept (default 0: keep all)
+        #[arg(long, default_value_t = orfedit::FRAMESHIFT_FLANK)]
+        frameshift_flank: usize,
+        /// ...of which at most this many may be unaligned
+        #[arg(long, default_value_t = orfedit::FRAMESHIFT_MAX_DELETED)]
+        frameshift_max_deleted: usize,
+        /// ...and the aligned ones must score at least this on average
+        #[arg(long, default_value_t = orfedit::FRAMESHIFT_MIN_FLANK_SCORE)]
+        frameshift_min_flank_score: f64,
+        /// A gene keeps its frame changes only if they improve its
+        /// alignment score by at least this much over a single frame
+        #[arg(long, default_value_t = orfedit::FRAMESHIFT_MIN_GAIN)]
+        frameshift_min_gain: f64,
     },
 }
 
@@ -113,7 +127,7 @@ struct OutRow {
     includes_stop: bool,
     protein: String,
     edits: Vec<(usize, usize, char)>, // genomic_pos, profile_column, resulting_aa
-    frameshifts: Vec<(usize, usize, usize, usize)>, // start, end, n_bases, profile_column
+    frameshifts: Vec<(usize, usize, usize, usize, usize, usize)>, // start, end, n_bases, profile_column, window
 }
 
 fn main() -> Result<()> {
@@ -130,6 +144,10 @@ fn main() -> Result<()> {
             edit_penalty,
             flank,
             frameshift_penalty,
+            frameshift_flank,
+            frameshift_max_deleted,
+            frameshift_min_flank_score,
+            frameshift_min_gain,
         } => {
             rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().ok();
 
@@ -157,7 +175,17 @@ fn main() -> Result<()> {
             for r in &rows {
                 groups.entry(r.fasta.clone()).or_default().push(r);
             }
-            let params = ScanParams { gap_open, gap_extend, edit_penalty, flank, frameshift_penalty };
+            let params = ScanParams {
+                gap_open,
+                gap_extend,
+                edit_penalty,
+                flank,
+                frameshift_penalty,
+                frameshift_flank,
+                frameshift_max_deleted,
+                frameshift_min_flank_score,
+                frameshift_min_gain,
+            };
 
             let group_vec: Vec<(&String, &Vec<&ManifestRow>)> = groups.iter().collect();
             let all_results: Vec<OutRow> = group_vec
@@ -206,7 +234,7 @@ fn main() -> Result<()> {
                                     frameshifts: outcome
                                         .frameshifts
                                         .into_iter()
-                                        .map(|f| (f.start, f.end, f.n_bases, f.profile_column))
+                                        .map(|f| (f.start, f.end, f.n_bases, f.profile_column, f.window_start, f.window_end))
                                         .collect(),
                                 });
                             }
@@ -280,12 +308,12 @@ fn write_outputs(
         }
         let tmp = path.with_extension("tsv.tmp");
         let mut w = String::new();
-        w.push_str("species\torganelle\tgene\tstart\tend\tn_bases\tprofile_column\n");
+        w.push_str("species\torganelle\tgene\tstart\tend\tn_bases\tprofile_column\twindow_start\twindow_end\n");
         for r in results {
-            for (start, end, n_bases, col) in &r.frameshifts {
+            for (start, end, n_bases, col, ws, we) in &r.frameshifts {
                 w.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                    r.species, r.organelle, r.gene, start, end, n_bases, col
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    r.species, r.organelle, r.gene, start, end, n_bases, col, ws, we
                 ));
             }
         }
