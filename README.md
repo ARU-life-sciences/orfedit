@@ -52,6 +52,19 @@ For one (genomic locus, reference profile) pair:
    it's a genuine (possibly edit-created) stop, folds it into the corrected
    span (`ScanOutcome::includes_stop`) rather than reporting a spurious
    "correction" on every single call regardless of real editing.
+   A profile often lacks a gene's last residue or two (it is built from
+   gene calls, some cut short), which left the stop not adjacent and the
+   gene those codons and the stop short. So when no stop follows directly
+   and the alignment reaches the profile's end, `scan-batch` looks up to
+   `--stop-search` codons (default 10; 0 for the adjacent codon only)
+   further on, in frame, for a literal stop and ends the gene there; and
+   a codon that would be a stop only after an edit (`CAA`/`CAG`/`CGA`)
+   with a literal stop straight after it is taken as the last residue.
+   The protein column still covers the profile's columns only. On the
+   single-exon genes of 24 RefSeq organelle genomes (`poa`'s
+   `build/exon_impl`), the corrected gene ends exactly at GenBank's stop
+   in 89% of plastid genes (17% before) and 80% of mito ones (67%), with
+   no end that was right before made wrong.
 
 Interior profile columns can only ever resolve to a real amino acid or a
 deletion, never to a stop/unrecognised translation: `Profile::score` scores
@@ -173,7 +186,7 @@ DNA-level gene call - `orfedit` extends/corrects outward from there, it
 doesn't discover genes de novo.)
 
 Tunable scoring: `--gap-open`, `--gap-extend`, `--edit-penalty`,
-`--frameshift-penalty`, and `--flank` (bp of genomic context to search around each anchor, default 300).
+`--frameshift-penalty`, `--stop-search`, and `--flank` (bp of genomic context to search around each anchor, default 300).
 
 ## Scope
 

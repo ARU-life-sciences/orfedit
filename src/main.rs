@@ -62,6 +62,11 @@ enum Command {
         /// alignment score by at least this much over a single frame
         #[arg(long, default_value_t = orfedit::FRAMESHIFT_MIN_GAIN)]
         frameshift_min_gain: f64,
+        /// When no stop codon directly follows the aligned protein, look
+        /// this many codons further on for one and extend the gene to it
+        /// (0: only a stop right after the last aligned codon counts)
+        #[arg(long, default_value_t = 10)]
+        stop_search: usize,
     },
 }
 
@@ -148,6 +153,7 @@ fn main() -> Result<()> {
             frameshift_max_deleted,
             frameshift_min_flank_score,
             frameshift_min_gain,
+            stop_search,
         } => {
             rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().ok();
 
@@ -185,6 +191,7 @@ fn main() -> Result<()> {
                 frameshift_max_deleted,
                 frameshift_min_flank_score,
                 frameshift_min_gain,
+                stop_search,
             };
 
             let group_vec: Vec<(&String, &Vec<&ManifestRow>)> = groups.iter().collect();

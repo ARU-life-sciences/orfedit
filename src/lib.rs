@@ -132,6 +132,14 @@ pub struct ScanParams {
     pub frameshift_min_flank_score: f64,
     /// See FRAMESHIFT_MIN_GAIN.
     pub frameshift_min_gain: f64,
+    /// When no stop codon directly follows the aligned protein, look this
+    /// many codons further on, in frame, for a literal one (TAA/TAG/TGA)
+    /// and extend the gene to it (0: don't). Only when the alignment
+    /// reaches the profile's end, give or take this many columns. A
+    /// profile often lacks a gene's last residue or two (boundary-truncated
+    /// training calls), which left the corrected gene those codons and the
+    /// stop short.
+    pub stop_search: usize,
 }
 
 impl Default for ScanParams {
@@ -146,6 +154,7 @@ impl Default for ScanParams {
             frameshift_max_deleted: FRAMESHIFT_MAX_DELETED,
             frameshift_min_flank_score: FRAMESHIFT_MIN_FLANK_SCORE,
             frameshift_min_gain: FRAMESHIFT_MIN_GAIN,
+            stop_search: 0,
         }
     }
 }
@@ -224,15 +233,24 @@ pub fn scan_gene(
                 .filter(|h| h.aa == codon::STOP)
                 .min_by_key(|h| h.n_edits)
             {
-                let (ext_start, ext_end) =
-                    sense_span_to_genomic(window_start, window_end, strand, sense_end, sense_end + 3);
+                // A stop that needs an edit (CAA/CAG/CGA), with a literal
+                // one straight after it: the codon is the protein's last
+                // residue (Gln/Arg, missing from the profile) and the
+                // literal stop the gene's.
+                let p = sense_end + 3;
+                let residue_then_stop = hyp.n_edits > 0
+                    && params.stop_search > 0
+                    && p + 3 <= sense_seq.len()
+                    && codon::translate_codon([sense_seq[p], sense_seq[p + 1], sense_seq[p + 2]]) == codon::STOP;
+                let stop_end = if residue_then_stop { p + 3 } else { p };
+                let (ext_start, ext_end) = sense_span_to_genomic(window_start, window_end, strand, sense_end, stop_end);
                 if strand == '+' {
                     corrected_end = ext_end;
                 } else {
                     corrected_start = ext_start;
                 }
                 includes_stop = true;
-                if hyp.n_edits > 0 {
+                if hyp.n_edits > 0 && !residue_then_stop {
                     for bit in 0..3u8 {
                         if hyp.edit_mask & (1 << bit) != 0 {
                             let sense_pos = sense_end + bit as usize;
@@ -241,6 +259,27 @@ pub fn scan_gene(
                         }
                     }
                 }
+            }
+        }
+    }
+    // No stop right there: a literal one a few codons on, with the
+    // alignment at (or nearly at) the profile's end, is the gene's own.
+    if !includes_stop && params.stop_search > 0 {
+        let trailing_deleted =
+            result.columns.iter().rev().take_while(|c| matches!(c, NtColumnCall::Deleted)).count();
+        if let (Some((_, sense_end)), true) = (result.sense_span, trailing_deleted <= params.stop_search) {
+            let stop_at = (1..=params.stop_search).map(|i| sense_end + 3 * i).find(|&p| {
+                p + 3 <= sense_seq.len()
+                    && codon::translate_codon([sense_seq[p], sense_seq[p + 1], sense_seq[p + 2]]) == codon::STOP
+            });
+            if let Some(p) = stop_at {
+                let (ext_start, ext_end) = sense_span_to_genomic(window_start, window_end, strand, sense_end, p + 3);
+                if strand == '+' {
+                    corrected_end = ext_end;
+                } else {
+                    corrected_start = ext_start;
+                }
+                includes_stop = true;
             }
         }
     }
@@ -330,6 +369,35 @@ mod tests {
         let out = scan_gene(&idx, "ctg", 0, 9, '+', &profile, &params).unwrap();
         assert!(!out.includes_stop);
         assert_eq!(out.corrected_end, 9);
+    }
+
+    #[test]
+    fn a_stop_a_few_codons_on_is_found_with_stop_search() {
+        // profile M K V; the gene has two more residues (GGG CCC) before TAA
+        let idx = fasta_with("ctg", "ATGAAAGTTGGGCCCTAAGGG");
+        let profile = mkv_profile();
+        let params = ScanParams { flank: 12, ..ScanParams::default() };
+        let out = scan_gene(&idx, "ctg", 0, 9, '+', &profile, &params).unwrap();
+        assert_eq!((out.includes_stop, out.corrected_end), (false, 9));
+        let params = ScanParams { stop_search: 2, ..params };
+        let out = scan_gene(&idx, "ctg", 0, 9, '+', &profile, &params).unwrap();
+        assert_eq!((out.includes_stop, out.corrected_end), (true, 18));
+        assert_eq!(out.protein, "MKV");
+        // too far for a one-codon search
+        let params = ScanParams { stop_search: 1, ..params };
+        let out = scan_gene(&idx, "ctg", 0, 9, '+', &profile, &params).unwrap();
+        assert_eq!((out.includes_stop, out.corrected_end), (false, 9));
+        // CAA could be an edit-made stop, but TAA follows it: Gln, then the stop
+        let idx = fasta_with("ctg", "ATGAAAGTTCAATAAGGG");
+        let out = scan_gene(&idx, "ctg", 0, 9, '+', &profile, &params).unwrap();
+        assert_eq!((out.includes_stop, out.corrected_end, out.edits.len()), (true, 15, 0));
+        let out = scan_gene(&idx, "ctg", 0, 9, '+', &profile, &ScanParams { stop_search: 0, ..params }).unwrap();
+        assert_eq!((out.includes_stop, out.corrected_end, out.edits.len()), (true, 12, 1));
+        // minus strand
+        let idx = fasta_with("ctg", "CCCTTAGGGCCCAACTTTCAT");
+        let params = ScanParams { stop_search: 2, ..params };
+        let out = scan_gene(&idx, "ctg", 12, 21, '-', &profile, &params).unwrap();
+        assert_eq!((out.includes_stop, out.corrected_start, out.corrected_end), (true, 3, 21));
     }
 
     #[test]
