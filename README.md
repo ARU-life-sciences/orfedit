@@ -114,6 +114,16 @@ Validation on the DToL plant organelle dataset (90,375 gene copies from
 - Penalty 30 instead: 90% found, a mean of 1.1 calls per assembly.
   The 10/2/1.5 flank filter at penalty 30: 81% found.
 
+Speed: the alignment looks codon scores up in a table built once per
+profile (125 codon classes per column), keeps one byte of traceback per
+cell, and for a large search (8 million cells or more - a whole contig,
+as `transsplice` asks for) first finds where the best alignment lies
+without any traceback, then aligns only that stretch. Results are the
+same, bit for bit (a unit test compares against the original
+implementation; all three output tables for the 90,375 DToL copies are
+unchanged), in 55 s instead of 6 min 56 s at 16 threads.
+`align::align_nt_frame0_score` gives an alignment's score alone.
+
 ## Output (`scan-batch`)
 
 `<gene-calls-out>`: one row per manifest row - `raw_start`/`raw_end` (echoed

@@ -57,6 +57,74 @@ fn best_hypothesis_score(profile: &Profile, col: usize, codon: [u8; 3], edit_pen
     best
 }
 
+/// Base class for the codon-score table: A, C, G, T, anything else.
+/// `translate_codon` and `codon_hypotheses` treat every non-ACGT byte the
+/// same way (it only ever matches a wildcard), so five classes are exact.
+#[inline]
+fn base_class(b: u8) -> usize {
+    match b {
+        b'A' => 0,
+        b'C' => 1,
+        b'G' => 2,
+        b'T' => 3,
+        _ => 4,
+    }
+}
+const N_CODON_CLASSES: usize = 125;
+
+/// For each of the 125 codon classes, its edit hypotheses as
+/// (index into AA_ORDER or None, n_edits), in `codon_hypotheses` order.
+fn codon_class_hypotheses() -> &'static Vec<Vec<(Option<usize>, u8)>> {
+    static TABLE: std::sync::OnceLock<Vec<Vec<(Option<usize>, u8)>>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        const REP: [u8; 5] = *b"ACGTN";
+        (0..N_CODON_CLASSES)
+            .map(|c| {
+                codon_hypotheses([REP[c / 25], REP[(c / 5) % 5], REP[c % 5]])
+                    .into_iter()
+                    .map(|h| (crate::codon::aa_index(h.aa), h.n_edits))
+                    .collect()
+            })
+            .collect()
+    })
+}
+
+/// `best_hypothesis_score(profile, col, codon, edit_penalty).0` for every
+/// profile column and codon class: `table[col * 125 + class]`. Same
+/// arithmetic in the same order as `best_hypothesis_score`, so the values
+/// are bit-identical; the DP then does one lookup per cell instead of
+/// enumerating (and heap-allocating) the hypotheses each time.
+fn hypothesis_score_table(profile: &Profile, edit_penalty: f64) -> Vec<f64> {
+    let hyps = codon_class_hypotheses();
+    let mut table = Vec::with_capacity(profile.len() * N_CODON_CLASSES);
+    for col in &profile.columns {
+        for class in hyps {
+            let mut best = NEG_INF;
+            for &(aa_idx, n_edits) in class {
+                let base = match aa_idx {
+                    Some(a) => col[a],
+                    None => NEG_INF,
+                };
+                let s = base - edit_penalty * n_edits as f64;
+                if s > best {
+                    best = s;
+                }
+            }
+            table.push(best);
+        }
+    }
+    table
+}
+
+/// Codon class of the codon ending at each sense position p (p >= 3).
+fn codon_classes(sense_seq: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; sense_seq.len() + 1];
+    for p in 3..=sense_seq.len() {
+        out[p] = (base_class(sense_seq[p - 3]) * 25 + base_class(sense_seq[p - 2]) * 5 + base_class(sense_seq[p - 1])) as u8;
+    }
+    out
+}
+
 /// `codons`: one reading frame's worth of complete codons from the genomic
 /// window, in genomic order (index 0 = first/leftmost codon in the window).
 pub fn align(
@@ -308,6 +376,7 @@ pub struct NtAlignResult {
     pub frameshifts: Vec<Frameshift>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum NtPtr {
     None,
@@ -353,7 +422,415 @@ pub fn align_nt_frame0(
     align_nt_from(profile, sense_seq, gap_open, gap_extend, edit_penalty, frameshift_penalty, false)
 }
 
+const PTR_M: u8 = 1;
+const PTR_EX: u8 = 2;
+const PTR_EY: u8 = 3;
+const PTR_SHIFT1: u8 = 4;
+const PTR_SHIFT2: u8 = 5;
+
+/// Alignments with at least this many DP cells (profile columns x sense
+/// bases) are done in two passes - see `align_nt_impl`.
+const TWO_PASS_MIN_CELLS: usize = 8_000_000;
+
 fn align_nt_from(
+    profile: &Profile,
+    sense_seq: &[u8],
+    gap_open: f64,
+    gap_extend: f64,
+    edit_penalty: f64,
+    frameshift_penalty: f64,
+    any_frame: bool,
+) -> NtAlignResult {
+    align_nt_impl(profile, sense_seq, gap_open, gap_extend, edit_penalty, frameshift_penalty, any_frame, TWO_PASS_MIN_CELLS)
+}
+
+/// Where the best alignment lies, found without keeping any traceback.
+struct Located {
+    score: f64,
+    /// Sense position the alignment ends at, and whether in M (else Ey).
+    end_p: usize,
+    in_m: bool,
+    /// Sense position (in row 0) the alignment's traceback would end at.
+    origin: usize,
+}
+
+/// One DP column (a sense position) of `locate`: the three states for
+/// every profile row, and the origin each cell's path started from.
+#[derive(Default)]
+struct LocateColumn {
+    m: Vec<f64>,
+    ex: Vec<f64>,
+    ey: Vec<f64>,
+    om: Vec<u32>,
+    oex: Vec<u32>,
+    oey: Vec<u32>,
+}
+
+/// The DP of `align_nt_impl` over the whole of `sense_seq`, scores only:
+/// each cell also carries the row-0 position its path started from (chosen
+/// by exactly the comparisons that set the traceback pointers). Cells are
+/// filled a sense position at a time (down the profile), which needs only
+/// the previous three positions: four short columns that stay in cache,
+/// however long the sequence, instead of rows as long as the contig.
+/// Every cell is computed from the same operands by the same operations as
+/// in the row-by-row fill, so scores are bit-identical.
+#[allow(clippy::too_many_arguments)]
+fn locate(
+    l: usize,
+    n: usize,
+    hyp_table: &[f64],
+    classes: &[u8],
+    gap_open: f64,
+    gap_extend: f64,
+    frameshift_penalty: f64,
+    any_frame: bool,
+) -> Located {
+    let w = n + 1;
+    assert!(w < u32::MAX as usize, "sequence too long");
+    let shifts = frameshift_penalty.is_finite();
+    let m_start = if any_frame { 3 } else { 1 };
+    // hypothesis scores by codon class, then profile column: one contiguous
+    // run per sense position
+    let mut hyp_by_class = vec![0.0f64; N_CODON_CLASSES * l];
+    for col in 0..l {
+        for class in 0..N_CODON_CLASSES {
+            hyp_by_class[class * l + col] = hyp_table[col * N_CODON_CLASSES + class];
+        }
+    }
+    let mut ring: Vec<LocateColumn> = (0..4)
+        .map(|_| LocateColumn {
+            m: vec![NEG_INF; l + 1],
+            ex: vec![NEG_INF; l + 1],
+            ey: vec![NEG_INF; l + 1],
+            om: vec![0; l + 1],
+            oex: vec![0; l + 1],
+            oey: vec![0; l + 1],
+        })
+        .collect();
+    let mut loc = Located { score: NEG_INF, end_p: 0, in_m: true, origin: 0 };
+    // In one frame without frame changes, only every third position can be
+    // reached at all (the rest stay -inf throughout): skip the others.
+    let step = if !any_frame && !shifts { 3 } else { 1 };
+    for p in (0..w).step_by(step) {
+        let mut c = std::mem::take(&mut ring[p % 4]);
+        // row 0: the free leading skip, and each frame's own first base
+        c.m[0] = if p < m_start { 0.0 } else { NEG_INF };
+        c.om[0] = p as u32;
+        c.ex[0] = if any_frame || p % 3 == 0 { 0.0 } else { NEG_INF };
+        c.oex[0] = p as u32;
+        c.ey[0] = NEG_INF;
+        if p >= 3 {
+            let b = &ring[(p + 1) % 4]; // position p - 3
+            let class = classes[p] as usize;
+            let hyp = &hyp_by_class[class * l..][..l];
+            // (Plain branches: measured faster here than branch-free
+            // selects. An unreachable predecessor (-inf) gives -inf without
+            // a test, since no hypothesis score is +inf or NaN.)
+            {
+                let (bm, bex, bey) = (&b.m[..l], &b.ex[..l], &b.ey[..l]);
+                let (bom, boex, boey) = (&b.om[..l], &b.oex[..l], &b.oey[..l]);
+                let (cm, com) = (&mut c.m[1..][..l], &mut c.om[1..][..l]);
+                for i in 0..l {
+                    let (pm, pex, pey) = (bm[i], bex[i], bey[i]);
+                    let (best_prev, origin) = if pm >= pex && pm >= pey {
+                        (pm, bom[i])
+                    } else if pex >= pey {
+                        (pex, boex[i])
+                    } else {
+                        (pey, boey[i])
+                    };
+                    cm[i] = hyp[i] + best_prev;
+                    com[i] = origin;
+                }
+            }
+            {
+                let (bm, bex) = (&b.m[1..][..l], &b.ex[1..][..l]);
+                let (bom, boex) = (&b.om[1..][..l], &b.oex[1..][..l]);
+                let (cex, coex) = (&mut c.ex[1..][..l], &mut c.oex[1..][..l]);
+                for i in 0..l {
+                    let open = bm[i] - gap_open;
+                    let ext = bex[i] - gap_extend;
+                    if open >= ext {
+                        cex[i] = open;
+                        coex[i] = bom[i];
+                    } else {
+                        cex[i] = ext;
+                        coex[i] = boex[i];
+                    }
+                }
+            }
+        } else {
+            c.m[1..].fill(NEG_INF);
+            c.ex[1..].fill(NEG_INF);
+        }
+        if shifts {
+            for d in [1usize, 2] {
+                if p >= d {
+                    let b = &ring[(p + 4 - d) % 4]; // position p - d
+                    for i in 1..l {
+                        let s = b.m[i] - frameshift_penalty;
+                        if s > c.ex[i] {
+                            c.ex[i] = s;
+                            c.oex[i] = b.om[i];
+                        }
+                    }
+                }
+            }
+        }
+        {
+            let (mut ey, mut ey_origin) = (c.ey[0], c.oey[0]);
+            let (cm, com) = (&c.m[..l], &c.om[..l]);
+            let (cey, coey) = (&mut c.ey[1..][..l], &mut c.oey[1..][..l]);
+            for i in 0..l {
+                let open = cm[i] - gap_open;
+                let ext = ey - gap_extend;
+                if open >= ext {
+                    ey = open;
+                    ey_origin = com[i];
+                } else {
+                    ey = ext;
+                }
+                cey[i] = ey;
+                coey[i] = ey_origin;
+            }
+        }
+        if c.m[l] > loc.score {
+            loc = Located { score: c.m[l], end_p: p, in_m: true, origin: c.om[l] as usize };
+        }
+        if c.ey[l] > loc.score {
+            loc = Located { score: c.ey[l], end_p: p, in_m: false, origin: c.oey[l] as usize };
+        }
+        ring[p % 4] = c;
+    }
+    loc
+}
+
+/// The alignment DP proper. Small problems fill the whole matrix, keeping a
+/// traceback pointer per cell. Large ones (`two_pass_min_cells`; whole-contig
+/// scans) first run `locate` to learn where the best alignment starts and
+/// ends, then fill only the columns between: the best path lies inside that
+/// window, every other cell there scores no more than it does in the full
+/// matrix, and all the DP's comparisons keep the on-path choice on a tie, so
+/// the traceback - and hence the result - is the same as the full matrix's
+/// (tested against the one-pass reference below).
+#[allow(clippy::too_many_arguments)]
+fn align_nt_impl(
+    profile: &Profile,
+    sense_seq: &[u8],
+    gap_open: f64,
+    gap_extend: f64,
+    edit_penalty: f64,
+    frameshift_penalty: f64,
+    any_frame: bool,
+    two_pass_min_cells: usize,
+) -> NtAlignResult {
+    let l = profile.len();
+    let n = sense_seq.len();
+    if l == 0 {
+        return NtAlignResult { score: 0.0, columns: vec![], sense_span: None, frameshifts: vec![] };
+    }
+    let hyp_table = hypothesis_score_table(profile, edit_penalty);
+    let classes = codon_classes(sense_seq);
+    let located = if (l + 1).saturating_mul(n + 1) >= two_pass_min_cells {
+        Some(locate(l, n, &hyp_table, &classes, gap_open, gap_extend, frameshift_penalty, any_frame))
+    } else {
+        None
+    };
+    // Sense positions lo..=hi are the DP columns filled (local q = p - lo).
+    let (lo, hi) = located.as_ref().map_or((0, n), |loc| (loc.origin, loc.end_p));
+    let w = hi - lo + 1;
+    let idx = |i: usize, q: usize| i * w + q;
+    let codon_at = |p: usize| [sense_seq[p - 3], sense_seq[p - 2], sense_seq[p - 1]];
+    let shifts = frameshift_penalty.is_finite();
+    let m_start = if any_frame { 3 } else { 1 };
+
+    // Scores roll over two profile rows; pointers are kept for traceback.
+    let mut prev_m = vec![NEG_INF; w];
+    let mut prev_ex = vec![NEG_INF; w];
+    let mut prev_ey = vec![NEG_INF; w];
+    for q in 0..w {
+        let p = lo + q;
+        if any_frame || p % 3 == 0 {
+            prev_ex[q] = 0.0; // free leading skip
+        }
+        if p < m_start {
+            prev_m[q] = 0.0; // each frame's alignment may start at its own first base
+        }
+    }
+    let mut cur_m = vec![NEG_INF; w];
+    let mut cur_ex = vec![NEG_INF; w];
+    let mut cur_ey = vec![NEG_INF; w];
+    // Traceback pointers, one byte per cell: bits 0-1 the M pointer, bits
+    // 2-4 the Ex pointer, bits 5-6 the Ey pointer (PTR_* codes below).
+    let mut ptrs = vec![0u8; (l + 1) * w];
+    let classes = &classes[lo..=hi];
+
+    for i in 1..=l {
+        let hyp_row = &hyp_table[(i - 1) * N_CODON_CLASSES..i * N_CODON_CLASSES];
+        let ptr_row = &mut ptrs[i * w..(i + 1) * w];
+        for p in 0..w {
+            let mut cell = 0u8;
+            // M[i][p]: column i-1 aligned to the codon ending at p.
+            cur_m[p] = NEG_INF;
+            if p >= 3 {
+                let (pm, pex, pey) = (prev_m[p - 3], prev_ex[p - 3], prev_ey[p - 3]);
+                let (best_prev, ptr) = if pm >= pex && pm >= pey {
+                    (pm, PTR_M)
+                } else if pex >= pey {
+                    (pex, PTR_EX)
+                } else {
+                    (pey, PTR_EY)
+                };
+                if best_prev > NEG_INF {
+                    let hyp_score = hyp_row[classes[p] as usize];
+                    cur_m[p] = hyp_score + best_prev;
+                    cell |= ptr;
+                }
+            }
+            // Ex[i][p]: an extra genome codon ending at p, or a frameshift.
+            cur_ex[p] = NEG_INF;
+            let mut ex_ptr = 0u8;
+            if p >= 3 {
+                let open = cur_m[p - 3] - gap_open;
+                let ext = cur_ex[p - 3] - gap_extend;
+                if open >= ext {
+                    cur_ex[p] = open;
+                    ex_ptr = PTR_M;
+                } else {
+                    cur_ex[p] = ext;
+                    ex_ptr = PTR_EX;
+                }
+            }
+            if shifts && i < l {
+                for (d, tag) in [(1usize, PTR_SHIFT1), (2, PTR_SHIFT2)] {
+                    if p >= d {
+                        let s = cur_m[p - d] - frameshift_penalty;
+                        if s > cur_ex[p] {
+                            cur_ex[p] = s;
+                            ex_ptr = tag;
+                        }
+                    }
+                }
+            }
+            cell |= ex_ptr << 2;
+            // Ey[i][p]: profile column i-1 with no genome codon.
+            let open = prev_m[p] - gap_open;
+            let ext = prev_ey[p] - gap_extend;
+            if open >= ext {
+                cur_ey[p] = open;
+                cell |= PTR_M << 5;
+            } else {
+                cur_ey[p] = ext;
+                cell |= PTR_EY << 5;
+            }
+            ptr_row[p] = cell;
+        }
+        std::mem::swap(&mut prev_m, &mut cur_m);
+        std::mem::swap(&mut prev_ex, &mut cur_ex);
+        std::mem::swap(&mut prev_ey, &mut cur_ey);
+    }
+
+    // Free trailing skip: prev_* now hold row L.
+    let mut best_q = 0usize;
+    let mut best_score = NEG_INF;
+    let mut best_in_m = true;
+    for q in 0..w {
+        if prev_m[q] > best_score {
+            best_score = prev_m[q];
+            best_q = q;
+            best_in_m = true;
+        }
+        if prev_ey[q] > best_score {
+            best_score = prev_ey[q];
+            best_q = q;
+            best_in_m = false;
+        }
+    }
+    if let Some(loc) = &located {
+        // The window must reproduce the located optimum exactly.
+        assert!(
+            best_score.to_bits() == loc.score.to_bits() && lo + best_q == loc.end_p && best_in_m == loc.in_m,
+            "two-pass alignment disagrees with its locating pass"
+        );
+    }
+
+    let mut columns: Vec<NtColumnCall> = Vec::with_capacity(l);
+    let mut frameshifts = Vec::new();
+    let (mut i, mut q) = (l, best_q);
+    let ptr_m = |i: usize, q: usize| ptrs[idx(i, q)] & 3;
+    let ptr_ex = |i: usize, q: usize| (ptrs[idx(i, q)] >> 2) & 7;
+    let ptr_ey = |i: usize, q: usize| (ptrs[idx(i, q)] >> 5) & 3;
+    let mut cur = if best_in_m { PTR_M } else { PTR_EY };
+    let mut first: Option<usize> = None;
+    let mut last: Option<usize> = None;
+    while i > 0 {
+        let p = lo + q; // sense position
+        match cur {
+            PTR_M => {
+                let (_, aa, n_edits, edit_mask) = best_hypothesis_score(profile, i - 1, codon_at(p), edit_penalty);
+                columns.push(NtColumnCall::Aligned { sense_start: p - 3, aa, n_edits, edit_mask });
+                last.get_or_insert(p);
+                first = Some(p - 3);
+                cur = ptr_m(i, q);
+                i -= 1;
+                q -= 3;
+            }
+            PTR_EY => {
+                columns.push(NtColumnCall::Deleted);
+                cur = ptr_ey(i, q);
+                i -= 1;
+            }
+            PTR_EX => match ptr_ex(i, q) {
+                PTR_M => {
+                    q -= 3;
+                    cur = PTR_M;
+                }
+                PTR_EX => q -= 3,
+                tag @ (PTR_SHIFT1 | PTR_SHIFT2) => {
+                    let d = if tag == PTR_SHIFT1 { 1 } else { 2 };
+                    frameshifts.push(Frameshift { sense_pos: p - d, n_bases: d, after_column: i, window: (p - d, p) });
+                    q -= d;
+                    cur = PTR_M;
+                }
+                _ => break,
+            },
+            _ => break, // the free leading skip (row 0)
+        }
+    }
+    columns.reverse();
+    frameshifts.reverse();
+    for f in frameshifts.iter_mut() {
+        if let Some((s, e)) = frameshift_window(profile, sense_seq, &columns, f.after_column, edit_penalty) {
+            f.window = (s.min(f.sense_pos), e.max(f.sense_pos + f.n_bases));
+        }
+    }
+    let sense_span = match (first, last) {
+        (Some(f), Some(la)) => Some((f, la)),
+        _ => None,
+    };
+    NtAlignResult { score: best_score, columns, sense_span, frameshifts }
+}
+
+/// The score `align_nt_frame0` would return, without building the
+/// alignment (no traceback matrix): for callers that only compare scores.
+pub fn align_nt_frame0_score(
+    profile: &Profile,
+    sense_seq: &[u8],
+    gap_open: f64,
+    gap_extend: f64,
+    edit_penalty: f64,
+    frameshift_penalty: f64,
+) -> f64 {
+    if profile.is_empty() {
+        return 0.0;
+    }
+    let hyp_table = hypothesis_score_table(profile, edit_penalty);
+    let classes = codon_classes(sense_seq);
+    locate(profile.len(), sense_seq.len(), &hyp_table, &classes, gap_open, gap_extend, frameshift_penalty, false).score
+}
+
+#[cfg(test)]
+fn align_nt_from_reference(
     profile: &Profile,
     sense_seq: &[u8],
     gap_open: f64,
@@ -774,5 +1251,52 @@ mod tests {
         assert!(f.window.0 <= f.sense_pos && f.sense_pos + 1 <= f.window.1);
         // any of the 10 As can be the extra one
         assert_eq!(f.window, (run_start, run_end), "window {:?}", f.window);
+    }
+
+    #[test]
+    fn table_and_packed_pointer_dp_matches_the_reference_implementation() {
+        let mut rng = Lcg(7);
+        let mut n_shift = 0;
+        for trial in 0..400 {
+            let n_codons = 5 + (rng.next() % 40) as usize;
+            let (mut seq, profile) = random_gene(&mut rng, n_codons);
+            // junk either side, the odd N, sometimes an indel
+            let n_junk = (rng.next() % 150) as usize;
+            let mut full = random_dna(&mut rng, n_junk);
+            if trial % 3 == 0 && seq.len() > 12 {
+                let at = 3 + (rng.next() as usize) % (seq.len() - 6);
+                if trial % 2 == 0 { seq.insert(at, b'A'); } else { seq.remove(at); }
+            }
+            full.extend(&seq);
+            let n_junk = (rng.next() % 150) as usize;
+            full.extend(random_dna(&mut rng, n_junk));
+            if trial % 5 == 0 {
+                let at = (rng.next() as usize) % full.len();
+                full[at] = b'N';
+            }
+            if trial % 7 == 0 {
+                let at = (rng.next() as usize) % full.len();
+                full[at] = b'c'; // lower case: a non-ACGT byte to the translator
+            }
+            for penalty in [f64::INFINITY, 20.0, 6.0] {
+                for any_frame in [true, false] {
+                    let b = align_nt_from_reference(&profile, &full, 8.0, 1.0, 2.5, penalty, any_frame);
+                    // one pass (full matrix) and two passes (locate, then a window)
+                    for two_pass_min_cells in [usize::MAX, 0] {
+                        let a = align_nt_impl(&profile, &full, 8.0, 1.0, 2.5, penalty, any_frame, two_pass_min_cells);
+                        assert_eq!(a.score.to_bits(), b.score.to_bits(), "score, trial {trial}");
+                        assert_eq!(format!("{:?}", a.columns), format!("{:?}", b.columns), "columns, trial {trial}");
+                        assert_eq!(a.sense_span, b.sense_span);
+                        assert_eq!(a.frameshifts, b.frameshifts);
+                        n_shift += a.frameshifts.len();
+                    }
+                    if !any_frame {
+                        let s = align_nt_frame0_score(&profile, &full, 8.0, 1.0, 2.5, penalty);
+                        assert_eq!(s.to_bits(), b.score.to_bits(), "score-only, trial {trial}");
+                    }
+                }
+            }
+        }
+        assert!(n_shift > 50, "the comparison should exercise frame changes ({n_shift})");
     }
 }
