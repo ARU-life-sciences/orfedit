@@ -83,8 +83,28 @@ enum Command {
         /// When no stop codon directly follows the aligned protein, look
         /// this many codons further on for one and extend the gene to it
         /// (0: only a stop right after the last aligned codon counts)
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 50)]
         stop_search: usize,
+        /// When the first aligned codon is not a start codon (ATG, or ACG
+        /// an edit makes AUG), start the gene at the nearest ATG within
+        /// this many codons instead (upstream, in an open frame; or
+        /// downstream, at a column whose references can start with Met),
+        /// else the nearest ACG (0: start where the alignment does)
+        #[arg(long, default_value_t = 10)]
+        start_search: usize,
+        /// Cost of a stop codon inside a gene whose protein goes on
+        /// matching beyond it (a pseudogene, a stop a lineage edits away,
+        /// an error): the stop is aligned to a profile column, `*` in the
+        /// protein, and counted in n_internal_stops. "inf": a gene ends at
+        /// its first stop, or gets round it by frame changes
+        #[arg(long, default_value_t = 20.0)]
+        internal_stop_penalty: f64,
+        /// A frame change or an internal stop with fewer than this many
+        /// profile columns before or after it is not kept: the gene starts
+        /// after it, or ends before it, in its own frame at its own stop
+        /// (0: kept anywhere)
+        #[arg(long, default_value_t = 25)]
+        end_margin: usize,
     },
 }
 
@@ -148,9 +168,10 @@ struct OutRow {
     n_columns_aligned: usize,
     n_columns_total: usize,
     includes_stop: bool,
+    n_internal_stops: usize,
     protein: String,
     edits: Vec<(usize, usize, char, bool)>, // genomic_pos, profile_column, resulting_aa, reverse
-    frameshifts: Vec<(usize, usize, usize, usize, usize, usize)>, // start, end, n_bases, profile_column, window
+    frameshifts: Vec<(usize, usize, usize, usize, usize, usize, bool)>, // start, end, n_bases, profile_column, window, near_end
 }
 
 fn main() -> Result<()> {
@@ -176,6 +197,9 @@ fn main() -> Result<()> {
             frameshift_min_flank_score,
             frameshift_min_gain,
             stop_search,
+            start_search,
+            internal_stop_penalty,
+            end_margin,
         } => {
             rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().ok();
 
@@ -218,6 +242,9 @@ fn main() -> Result<()> {
                 frameshift_min_flank_score,
                 frameshift_min_gain,
                 stop_search,
+                start_search,
+                internal_stop_penalty,
+                end_margin,
             };
 
             let group_vec: Vec<(&String, &Vec<&ManifestRow>)> = groups.iter().collect();
@@ -262,12 +289,13 @@ fn main() -> Result<()> {
                                     n_columns_aligned: outcome.n_columns_aligned,
                                     n_columns_total: outcome.n_columns_total,
                                     includes_stop: outcome.includes_stop,
+                                    n_internal_stops: outcome.n_internal_stops,
                                     protein: outcome.protein,
                                     edits: outcome.edits.into_iter().map(|e| (e.genomic_pos, e.profile_column, e.resulting_aa, e.reverse)).collect(),
                                     frameshifts: outcome
                                         .frameshifts
                                         .into_iter()
-                                        .map(|f| (f.start, f.end, f.n_bases, f.profile_column, f.window_start, f.window_end))
+                                        .map(|f| (f.start, f.end, f.n_bases, f.profile_column, f.window_start, f.window_end, f.near_end))
                                         .collect(),
                                 });
                             }
@@ -285,7 +313,7 @@ fn main() -> Result<()> {
                 "[info] orfedit: {} genes scanned, {} corrected, {} with frameshifts -> {}",
                 all_results.len(),
                 all_results.iter().filter(|r| r.changed).count(),
-                all_results.iter().filter(|r| !r.frameshifts.is_empty()).count(),
+                all_results.iter().filter(|r| r.frameshifts.iter().any(|f| !f.6)).count(),
                 gene_calls_out.display()
             );
             Ok(())
@@ -309,13 +337,13 @@ fn write_outputs(
     let tmp_gc = gene_calls_out.with_extension("tsv.tmp");
     {
         let mut w = String::new();
-        w.push_str("species\torganelle\tgene\tframe\tscore\traw_start\traw_end\tcorrected_start\tcorrected_end\tchanged\tn_edits\tn_columns_aligned\tn_columns_total\tincludes_stop\tn_frameshifts\tprotein\n");
+        w.push_str("species\torganelle\tgene\tframe\tscore\traw_start\traw_end\tcorrected_start\tcorrected_end\tchanged\tn_edits\tn_columns_aligned\tn_columns_total\tincludes_stop\tn_frameshifts\tprotein\tn_internal_stops\n");
         for r in results {
             w.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 r.species, r.organelle, r.gene, r.frame, r.score, r.raw_start, r.raw_end,
                 r.corrected_start, r.corrected_end, r.changed, r.n_edits, r.n_columns_aligned, r.n_columns_total,
-                r.includes_stop, r.frameshifts.len(), r.protein
+                r.includes_stop, r.frameshifts.iter().filter(|f| !f.6).count(), r.protein, r.n_internal_stops
             ));
         }
         fs::write(&tmp_gc, w)?;
@@ -342,12 +370,12 @@ fn write_outputs(
         }
         let tmp = path.with_extension("tsv.tmp");
         let mut w = String::new();
-        w.push_str("species\torganelle\tgene\tstart\tend\tn_bases\tprofile_column\twindow_start\twindow_end\n");
+        w.push_str("species\torganelle\tgene\tstart\tend\tn_bases\tprofile_column\twindow_start\twindow_end\tnear_end\n");
         for r in results {
-            for (start, end, n_bases, col, ws, we) in &r.frameshifts {
+            for (start, end, n_bases, col, ws, we, near_end) in &r.frameshifts {
                 w.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                    r.species, r.organelle, r.gene, start, end, n_bases, col, ws, we
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    r.species, r.organelle, r.gene, start, end, n_bases, col, ws, we, near_end
                 ));
             }
         }

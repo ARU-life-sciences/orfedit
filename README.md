@@ -52,19 +52,22 @@ For one (genomic locus, reference profile) pair:
    it's a genuine (possibly edit-created) stop, folds it into the corrected
    span (`ScanOutcome::includes_stop`) rather than reporting a spurious
    "correction" on every single call regardless of real editing.
-   A profile often lacks a gene's last residue or two (it is built from
-   gene calls, some cut short), which left the stop not adjacent and the
-   gene those codons and the stop short. So when no stop follows directly
-   and the alignment reaches the profile's end, `scan-batch` looks up to
-   `--stop-search` codons (default 10; 0 for the adjacent codon only)
+   A profile often lacks a gene's last residues (it is built from gene
+   calls, some cut short; or the gene's tail is longer in this species
+   than in most), and a gene may end short of its profile's last columns.
+   So when no stop follows directly, `scan-batch` looks up to
+   `--stop-search` codons (default 50; 0 for the adjacent codon only)
    further on, in frame, for a literal stop and ends the gene there; and
    a codon that would be a stop only after an edit (`CAA`/`CAG`/`CGA`)
    with a literal stop straight after it is taken as the last residue.
-   The protein column still covers the profile's columns only. On the
-   single-exon genes of 24 RefSeq organelle genomes (`poa`'s
-   `build/exon_impl`), the corrected gene ends exactly at GenBank's stop
-   in 89% of plastid genes (17% before) and 80% of mito ones (67%), with
-   no end that was right before made wrong.
+   The protein column still covers the profile's columns only. See "Where
+   a gene ends" below.
+5. The anchor is not always the whole gene (oatkDB's rbcL model is the
+   gene's first 698 bp of 1,430, and 300 bp beyond its hit the window
+   ended at codon 341). Where the alignment runs into an end of its
+   window with profile columns left over, or counting on from its first
+   aligned column the profile would run past the window, the window is
+   lengthened that way and the gene aligned again (twice at most).
 
 Interior profile columns can only ever resolve to a real amino acid or a
 deletion, never to a stop/unrecognised translation: `Profile::score` scores
@@ -136,6 +139,85 @@ same, bit for bit (a unit test compares against the original
 implementation; all three output tables for the 90,375 DToL copies are
 unchanged), in 55 s instead of 6 min 56 s at 16 threads.
 `align::align_nt_frame0_score` gives an alignment's score alone.
+
+## Where a gene starts
+
+The alignment starts a gene wherever the profile's first columns match,
+which is not always at a start codon: of 457 single-exon genes in 19
+RefSeq angiosperm mitogenomes, 42 called genes began at a codon that is
+none of ATG, ACG, GTG or TTG. With `--start-search N` (default 10; 0 to
+start where the alignment does), a gene whose first aligned codon is
+neither ATG nor ACG (which an edit makes AUG) starts at the nearest ATG
+within N codons instead: upstream, in frame and with no stop between
+(the gene is lengthened; the protein still covers the profile's columns
+only), or downstream, at a codon the alignment puts in a column where
+the references' Met scores positively (the columns before it are given
+up). Failing an ATG, the nearest ACG is taken the same way; failing
+both, the start is left alone.
+
+On the single-exon genes of 19 RefSeq angiosperm mitogenomes and 13
+RefSeq plastomes, starts within 3 bp of the annotated ones went from 384
+to 401 of 457 (mito) and from 528 to 574 of 626 (plastid), with one
+start that was right made wrong (Arabidopsis ccmFn2, annotated at a GTG
+six codons from an ATG). At 5, 15, 20 and 30 codons: 393/559, 407/576,
+409/577 and 409/576, with 1, 6, 8 and 9 made wrong - genes annotated
+with another start codon (TTG, GTG, ATT, ATA) and an ATG near them.
+What is left is mostly genes whose annotated start lies far from the
+conserved part (atp6 has N-terminal extensions of 18 to 146 codons in
+these genomes) or differs between records (rps4, mttB, rpl16).
+
+## Where a gene ends
+
+A reading frame ends at its first stop codon. The aligner used to treat
+a stop as one more codon it could leave out, so wherever a gene ended a
+few residues before its profile did, the alignment stepped over the stop
+to match the profile's last columns (maize cob ends `...KYYTE*`, and was
+read on through two stops), and likewise before a gene's start. A stop
+codon now cannot lie in an insertion (unless stops are read through,
+`--stop-edit-penalty`). Three rules follow from that:
+
+- **The stop.** A literal stop right after the aligned protein ends the
+  gene; so does one an edit makes (`CAA`/`CAG`/`CGA`) there, provided
+  the protein ends with its profile (at most two of the profile's last
+  columns unaligned). Otherwise the first literal stop within
+  `--stop-search` codons does, and only failing that an edit-made one.
+- **Internal stops** (`--internal-stop-penalty`, default 20; `inf` for
+  none). A gene whose protein goes on matching beyond a stop - a
+  pseudogene, a stop a lineage edits away, an error - has the stop
+  aligned to a profile column at this cost: `*` in the protein, counted
+  in `n_internal_stops`. Without it such a gene is cut at the stop, or
+  the alignment gets round the stop with two frame changes; the cost
+  should not exceed that of one frame change.
+- **The margin** (`--end-margin`, default 25 profile columns; a quarter
+  of a short profile at most). The gene is not read through an internal
+  stop or a frame change with fewer columns than this before it or
+  after it: it starts after it, or ends before it in its own frame at
+  its own stop. One that buys only the profile's last few columns
+  cannot be told from a gene that ends differently there (Arabidopsis
+  atp4 changes frame eight columns from the end, in a run of eleven Gs,
+  to match the other angiosperms' tail; it is annotated to the stop two
+  codons on). If the gene has no other breaks it is aligned again in one
+  frame; if it has, those are kept and the columns outside go unaligned.
+  The frame change itself is still reported, in `<frameshifts-out>` with
+  `near_end` true (and not counted in `n_frameshifts`): an indel there is
+  as worth checking against the reads as any other. Dropping them
+  outright cost 12 points of the 1-bp indels planted in real genes that
+  are found (95% to 83% of 1,500 at a margin of 25; 94%, 90% and 86% at
+  10, 15 and 20).
+
+On the single-exon genes of 19 RefSeq angiosperm mitogenomes and 13
+RefSeq plastomes (`poa`'s `build/rnaedit/ends`), with the same profiles
+before and after: genes ending within 3 bp of the annotated stop went
+from 397 to 443 of 457 (mito) and from 558 to 621 of 626 (plastid), and
+rbcL from 341 of 474 codons to all of them; one end that was right was
+made wrong (an edit-made stop a codon beyond the profile's end, where a
+literal one 13 codons on is now taken). Frame changes called in those
+mito genes went from 23 to 3. Margins of 15, 20, 25 and 30 gave 436,
+440, 443 and 443 mito stops; internal-stop costs of 15 to 30 the same
+ends; stop searches of 10, 20, 30, 50 and 100 codons 583, 596, 611, 617
+and 618 plastid stops (before the longer windows). A gene that ends
+before its profile's tail no longer counts as aligned over the whole
+profile, which it used to by the step over the stop.
 
 ## Reverse (U-to-C) editing
 
@@ -215,14 +297,17 @@ the exact same bp as an independently-called boundary even with zero real
 editing, so raw coordinate (in)equality is not a usable "did anything
 biological happen" signal; compare `raw_*`/`corrected_*` yourself if you
 want boundary drift regardless of editing. `n_frameshifts` counts the
-frame changes in the gene, and `frame` is the frame (0-2, within the
-window) of its first aligned codon. `<edits-out>`: one row per
+frame changes in the gene, `n_internal_stops` (the last column) the stop
+codons aligned inside it (`*` in the protein), and `frame` is the frame
+(0-2, within the window) of its first aligned codon. `<edits-out>`: one row per
 predicted edit site (genomic position, which profile column - or the
 profile length itself, for a predicted edit-created stop - and the
 resulting amino acid). `<frameshifts-out>` (optional): one row per
 frame change - `start`/`end` (0-based half-open genomic span of the
 skipped bases), `n_bases` (1 or 2), `profile_column` (the column after
-it) and `window_start`/`window_end` (the window, containing start/end).
+it), `window_start`/`window_end` (the window, containing start/end) and
+`near_end` (true for one within `--end-margin` of the profile's start
+or end, which the gene's span and protein do not follow).
 
 ## Profile format
 
@@ -254,7 +339,7 @@ DNA-level gene call - `orfedit` extends/corrects outward from there, it
 doesn't discover genes de novo.)
 
 Tunable scoring: `--gap-open`, `--gap-extend`, `--edit-penalty`,
-`--frameshift-penalty`, `--stop-search`, `--stop-edit-penalty`, `--reverse-edit-penalty`, and `--flank` (bp of genomic context to search around each anchor, default 300).
+`--frameshift-penalty`, `--stop-search`, `--internal-stop-penalty`, `--end-margin`, `--stop-edit-penalty`, `--reverse-edit-penalty`, and `--flank` (bp of genomic context to search around each anchor, default 300; lengthened for a gene that runs out of it).
 
 ## Scope
 

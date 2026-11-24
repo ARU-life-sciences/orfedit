@@ -67,6 +67,13 @@ fn best_hypothesis_score(profile: &Profile, col: usize, codon: [u8; 3], edit_pen
             }
         }
     }
+    // a literal stop let through as a residue unknown (EditCosts::internal_stop)
+    if edit_penalty.internal_stop.is_finite() && crate::codon::translate_codon(codon) == crate::codon::STOP {
+        let s = -edit_penalty.internal_stop;
+        if s > best.0 {
+            best = (s, crate::codon::STOP, 0, 0);
+        }
+    }
     best
 }
 
@@ -115,10 +122,11 @@ fn codon_class_hypotheses() -> &'static Vec<ClassHypotheses> {
 fn hypothesis_score_table(profile: &Profile, edit_penalty: EditCosts) -> Vec<f64> {
     let hyps = codon_class_hypotheses();
     let reverse = edit_penalty.reverse();
+    let stop_class = stop_classes();
     let mut table = Vec::with_capacity(profile.len() * N_CODON_CLASSES);
     for (i, col) in profile.columns.iter().enumerate() {
         let edit_penalty = edit_penalty.at(profile.edit_site(i));
-        for (forward, backward) in hyps {
+        for (class, (forward, backward)) in hyps.iter().enumerate() {
             let mut best = NEG_INF;
             let readings = forward.iter().chain(backward.iter().filter(|_| reverse));
             for &(aa_idx, n_edits, n_rev, n_stop) in readings {
@@ -127,6 +135,12 @@ fn hypothesis_score_table(profile: &Profile, edit_penalty: EditCosts) -> Vec<f64
                     None => NEG_INF,
                 };
                 let s = base - edit_penalty.cost(n_edits, n_rev, n_stop);
+                if s > best {
+                    best = s;
+                }
+            }
+            if edit_penalty.internal_stop.is_finite() && stop_class[class] {
+                let s = -edit_penalty.internal_stop;
                 if s > best {
                     best = s;
                 }
@@ -144,6 +158,33 @@ fn codon_classes(sense_seq: &[u8]) -> Vec<u8> {
         out[p] = (base_class(sense_seq[p - 3]) * 25 + base_class(sense_seq[p - 2]) * 5 + base_class(sense_seq[p - 1])) as u8;
     }
     out
+}
+
+/// What it costs, on top of the gap, to leave a genome codon out of the
+/// alignment as an insertion when that codon is a literal stop, by codon
+/// class: the price of reading a stop through (`EditCosts::u_to_c_stop`,
+/// infinite unless a lineage's stops are read through), and nothing for any
+/// other codon. A reading frame cannot run on past a stop, so an alignment
+/// may not step over one to reach the profile columns beyond it - which,
+/// when it was free, it did wherever a gene ended a few residues before its
+/// profile (maize cob ends `...KYYTE*`, and was read on through two stops
+/// to match the profile's last seven columns), and at a gene's start too.
+/// A gene that does go on beyond a stop has it aligned to a column, at
+/// `EditCosts::internal_stop`, where it shows in the protein.
+fn inserted_stop_costs(costs: EditCosts) -> [f64; N_CODON_CLASSES] {
+    let mut out = [0.0; N_CODON_CLASSES];
+    for (cost, is_stop) in out.iter_mut().zip(stop_classes()) {
+        if is_stop {
+            *cost = costs.u_to_c_stop;
+        }
+    }
+    out
+}
+
+/// Which codon classes are a literal stop.
+fn stop_classes() -> [bool; N_CODON_CLASSES] {
+    const REP: [u8; 5] = *b"ACGTN";
+    std::array::from_fn(|c| crate::codon::translate_codon([REP[c / 25], REP[(c / 5) % 5], REP[c % 5]]) == crate::codon::STOP)
 }
 
 /// `codons`: one reading frame's worth of complete codons from the genomic
@@ -205,9 +246,11 @@ pub fn align(
             // stash the winning hypothesis inline via re-derivation at traceback time
             let _ = (aa, n_edits, edit_mask);
 
-            // Ex[i][j]: consume a genome codon, profile index stays i.
-            let open = mat_m[idx(i, j - 1)] - gap_open;
-            let ext = mat_ex[idx(i, j - 1)] - gap_extend;
+            // Ex[i][j]: consume a genome codon, profile index stays i - not
+            // a stop codon, unless stops are read through (inserted_stop_costs).
+            let ins = if crate::codon::translate_codon(codons[j - 1]) == crate::codon::STOP { edit_penalty.u_to_c_stop } else { 0.0 };
+            let open = mat_m[idx(i, j - 1)] - gap_open - ins;
+            let ext = mat_ex[idx(i, j - 1)] - gap_extend - ins;
             if open >= ext {
                 mat_ex[idx(i, j)] = open;
                 ptr_ex[idx(i, j)] = Ptr::FromM;
@@ -510,6 +553,7 @@ fn locate(
     gap_extend: f64,
     frameshift_penalty: f64,
     any_frame: bool,
+    ins_cost: &[f64; N_CODON_CLASSES],
 ) -> Located {
     let w = n + 1;
     assert!(w < u32::MAX as usize, "sequence too long");
@@ -573,9 +617,10 @@ fn locate(
                 let (bm, bex) = (&b.m[1..][..l], &b.ex[1..][..l]);
                 let (bom, boex) = (&b.om[1..][..l], &b.oex[1..][..l]);
                 let (cex, coex) = (&mut c.ex[1..][..l], &mut c.oex[1..][..l]);
+                let ins = ins_cost[class];
                 for i in 0..l {
-                    let open = bm[i] - gap_open;
-                    let ext = bex[i] - gap_extend;
+                    let open = bm[i] - gap_open - ins;
+                    let ext = bex[i] - gap_extend - ins;
                     if open >= ext {
                         cex[i] = open;
                         coex[i] = bom[i];
@@ -657,9 +702,10 @@ fn align_nt_impl(
         return NtAlignResult { score: 0.0, columns: vec![], sense_span: None, frameshifts: vec![] };
     }
     let hyp_table = hypothesis_score_table(profile, edit_penalty);
+    let ins_cost = inserted_stop_costs(edit_penalty);
     let classes = codon_classes(sense_seq);
     let located = if (l + 1).saturating_mul(n + 1) >= two_pass_min_cells {
-        Some(locate(l, n, &hyp_table, &classes, gap_open, gap_extend, frameshift_penalty, any_frame))
+        Some(locate(l, n, &hyp_table, &classes, gap_open, gap_extend, frameshift_penalty, any_frame, &ins_cost))
     } else {
         None
     };
@@ -718,8 +764,9 @@ fn align_nt_impl(
             cur_ex[p] = NEG_INF;
             let mut ex_ptr = 0u8;
             if p >= 3 {
-                let open = cur_m[p - 3] - gap_open;
-                let ext = cur_ex[p - 3] - gap_extend;
+                let ins = ins_cost[classes[p] as usize];
+                let open = cur_m[p - 3] - gap_open - ins;
+                let ext = cur_ex[p - 3] - gap_extend - ins;
                 if open >= ext {
                     cur_ex[p] = open;
                     ex_ptr = PTR_M;
@@ -853,8 +900,9 @@ pub fn align_nt_frame0_score(
         return 0.0;
     }
     let hyp_table = hypothesis_score_table(profile, edit_penalty);
+    let ins_cost = inserted_stop_costs(edit_penalty);
     let classes = codon_classes(sense_seq);
-    locate(profile.len(), sense_seq.len(), &hyp_table, &classes, gap_open, gap_extend, frameshift_penalty, false).score
+    locate(profile.len(), sense_seq.len(), &hyp_table, &classes, gap_open, gap_extend, frameshift_penalty, false, &ins_cost).score
 }
 
 #[cfg(test)]
@@ -916,8 +964,9 @@ fn align_nt_from_reference(
             // Ex[i][p]: an extra genome codon ending at p, or a frameshift.
             cur_ex[p] = NEG_INF;
             if p >= 3 {
-                let open = cur_m[p - 3] - gap_open;
-                let ext = cur_ex[p - 3] - gap_extend;
+                let ins = if crate::codon::translate_codon(codon_at(p)) == crate::codon::STOP { edit_penalty.u_to_c_stop } else { 0.0 };
+                let open = cur_m[p - 3] - gap_open - ins;
+                let ext = cur_ex[p - 3] - gap_extend - ins;
                 if open >= ext {
                     cur_ex[p] = open;
                     ptr_ex[idx(i, p)] = NtPtr::FromM;
@@ -1258,6 +1307,59 @@ mod tests {
     }
 
     #[test]
+    fn an_insertion_cannot_step_over_a_stop_codon() {
+        // the gene is M V W F E and a stop; four codons on, K K K K would
+        // fill the profile's last four columns
+        let profile = single_aa_profile("t", b"MVWFEKKKK");
+        let seq = b"ATGGTTTGGTTTGAATAACCCAAAAAAAAAAAATAG";
+        for frameshift_penalty in [f64::INFINITY, 20.0] {
+            let r = align_nt(&profile, seq, 8.0, 1.0, 2.5, frameshift_penalty);
+            assert_eq!(r.sense_span, Some((0, 15)), "the gene ends at its stop");
+            assert!(r.columns[5..].iter().all(|c| matches!(c, NtColumnCall::Deleted)));
+            assert!(r.frameshifts.is_empty());
+        }
+        // one frame's codons, the same
+        let codons: Vec<[u8; 3]> = seq.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        assert_eq!(align(&profile, &codons, 8.0, 1.0, 2.5).codon_span, Some((0, 5)));
+        // an ordinary codon in the same place is stepped over, as ever
+        let r = align_nt(&profile, b"ATGGTTTGGTTTGAAGGACCCAAAAAAAAAAAATAG", 8.0, 1.0, 2.5, f64::INFINITY);
+        assert_eq!(r.sense_span, Some((0, 33)));
+        // and so is a stop where stops are read through, at that cost
+        let costs = EditCosts { c_to_u: 2.5, u_to_c: f64::INFINITY, u_to_c_stop: 2.0, c_to_u_known: 2.5, c_to_u_novel: 2.5, internal_stop: f64::INFINITY };
+        let r = align_nt(&profile, seq, 8.0, 1.0, costs, f64::INFINITY);
+        assert_eq!(r.sense_span, Some((0, 33)));
+        // before the gene's first column a stop is only sequence that is not the gene
+        let r = align_nt(&profile, b"TAACCCATGGTTTGGTTTGAAAAAAAAAAAAAATAG", 8.0, 1.0, 2.5, f64::INFINITY);
+        assert_eq!(r.sense_span, Some((6, 33)));
+    }
+
+    #[test]
+    fn a_stop_inside_a_gene_is_aligned_to_a_column_at_a_price() {
+        // M V W F E, a stop where the profile has K, then (MVWFE)x3
+        let mut aas = b"MVWFEK".to_vec();
+        aas.extend(b"MVWFE".repeat(3));
+        let profile = single_aa_profile("t", &aas);
+        let seq = format!("ATGGTTTGGTTTGAATAA{}TAG", "ATGGTTTGGTTTGAA".repeat(3));
+        // as it is, the longer side of the stop is the gene
+        let r = align_nt(&profile, seq.as_bytes(), 8.0, 1.0, 2.5, f64::INFINITY);
+        assert_eq!(r.sense_span, Some((18, 63)));
+        // with a price on it, the stop is read through and shows
+        let costs = EditCosts { internal_stop: 20.0, ..EditCosts::from(2.5) };
+        for two_pass_min_cells in [usize::MAX, 0] {
+            let r = align_nt_impl(&profile, seq.as_bytes(), 8.0, 1.0, costs, f64::INFINITY, true, two_pass_min_cells);
+            assert_eq!(r.sense_span, Some((0, 63)));
+            assert!(matches!(r.columns[5], NtColumnCall::Aligned { aa: b'*', n_edits: 0, .. }));
+            assert_eq!(r.score, 20.0 * 5.0 - 20.0);
+        }
+        // and is preferred to two frame changes round it, which is what a finite frame-change cost alone gives
+        let r = align_nt(&profile, seq.as_bytes(), 8.0, 1.0, 2.5, 6.0);
+        assert_eq!(r.frameshifts.len(), 2);
+        let r = align_nt(&profile, seq.as_bytes(), 8.0, 1.0, costs, 15.0);
+        assert!(r.frameshifts.is_empty());
+        assert_eq!(r.sense_span, Some((0, 63)));
+    }
+
+    #[test]
     fn homopolymer_insertion_gets_the_whole_run_as_its_window() {
         // (MVWFE)x4 + V KKK W + (MVWFE)x4, with one extra A in the AAAAAAAAA run
         let flank = "ATGGTTTGGTTTGAA".repeat(4);
@@ -1286,7 +1388,7 @@ mod tests {
     fn reverse_editing_dp_matches_the_reference_implementation() {
         // the score table and the per-codon enumeration must agree with
         // U->C readings in play too, in one pass and in two
-        let costs = EditCosts { c_to_u: 2.5, u_to_c: 3.0, u_to_c_stop: 2.0, c_to_u_known: 2.5, c_to_u_novel: 2.5 };
+        let costs = EditCosts { c_to_u: 2.5, u_to_c: 3.0, u_to_c_stop: 2.0, c_to_u_known: 2.5, c_to_u_novel: 2.5, internal_stop: f64::INFINITY };
         let mut rng = Lcg(11);
         let mut n_rev = 0;
         for trial in 0..200 {

@@ -96,6 +96,12 @@ pub struct EditCosts {
     /// columns, 95%.
     pub c_to_u_known: f64,
     pub c_to_u_novel: f64,
+    /// Cost of aligning a literal in-frame stop codon to a profile column
+    /// as a residue unknown (`*` in the protein): a gene with a stop inside
+    /// it - a pseudogene, a stop a lineage edits away, an error - whose
+    /// protein goes on matching beyond. Infinite for none: the alignment
+    /// ends at the stop, or gets round it by frame changes.
+    pub internal_stop: f64,
 }
 
 impl EditCosts {
@@ -132,7 +138,7 @@ impl EditCosts {
 
 impl From<f64> for EditCosts {
     fn from(c_to_u: f64) -> Self {
-        EditCosts { c_to_u, u_to_c: f64::INFINITY, u_to_c_stop: f64::INFINITY, c_to_u_known: c_to_u, c_to_u_novel: c_to_u }
+        EditCosts { c_to_u, u_to_c: f64::INFINITY, u_to_c_stop: f64::INFINITY, c_to_u_known: c_to_u, c_to_u_novel: c_to_u, internal_stop: f64::INFINITY }
     }
 }
 
@@ -251,15 +257,15 @@ mod tests {
         assert!(!costs.reverse());
         assert_eq!(costs.cost(2, 0, 0), 5.0);
         assert!(costs.cost(0, 0, 1).is_infinite() && costs.cost(0, 1, 0).is_infinite());
-        let both = EditCosts { c_to_u: 2.5, u_to_c: 8.0, u_to_c_stop: 3.0, c_to_u_known: 2.5, c_to_u_novel: 2.5 };
+        let both = EditCosts { c_to_u: 2.5, u_to_c: 8.0, u_to_c_stop: 3.0, c_to_u_known: 2.5, c_to_u_novel: 2.5, internal_stop: f64::INFINITY };
         assert!(both.reverse());
         assert_eq!(both.cost(1, 2, 0), 18.5);
         assert_eq!(both.cost(0, 0, 1), 3.0);
         // stops only: an ordinary reverse edit stays ruled out
-        let stops = EditCosts { c_to_u: 2.5, u_to_c: f64::INFINITY, u_to_c_stop: 3.0, c_to_u_known: 2.5, c_to_u_novel: 2.5 };
+        let stops = EditCosts { c_to_u: 2.5, u_to_c: f64::INFINITY, u_to_c_stop: 3.0, c_to_u_known: 2.5, c_to_u_novel: 2.5, internal_stop: f64::INFINITY };
         // a profile that says where its references are edited: one cost for a C->U at such a
         // column, another elsewhere; nothing else changes, and nothing at all without the say
-        let apart = EditCosts { c_to_u: 2.5, u_to_c: 8.0, u_to_c_stop: 3.0, c_to_u_known: 1.0, c_to_u_novel: 9.0 };
+        let apart = EditCosts { c_to_u: 2.5, u_to_c: 8.0, u_to_c_stop: 3.0, c_to_u_known: 1.0, c_to_u_novel: 9.0, internal_stop: f64::INFINITY };
         assert_eq!(apart.at(None).cost(1, 1, 0), 10.5);
         assert_eq!(apart.at(Some(true)).cost(1, 1, 0), 9.0);
         assert_eq!(apart.at(Some(false)).cost(1, 1, 0), 17.0);
