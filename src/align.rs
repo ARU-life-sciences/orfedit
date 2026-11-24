@@ -51,6 +51,7 @@ pub struct AlignResult {
 /// readings first, so that without reverse editing - and on a tie with it -
 /// the result is what it always was.
 fn best_hypothesis_score(profile: &Profile, col: usize, codon: [u8; 3], edit_penalty: EditCosts) -> (f64, u8, u8, u8) {
+    let edit_penalty = edit_penalty.at(profile.edit_site(col));
     let mut best = (NEG_INF, b'X', 0u8, 0u8);
     for h in codon_hypotheses(codon) {
         let s = profile.score(col, h.aa) - edit_penalty.cost(h.n_edits, 0, 0);
@@ -115,7 +116,8 @@ fn hypothesis_score_table(profile: &Profile, edit_penalty: EditCosts) -> Vec<f64
     let hyps = codon_class_hypotheses();
     let reverse = edit_penalty.reverse();
     let mut table = Vec::with_capacity(profile.len() * N_CODON_CLASSES);
-    for col in &profile.columns {
+    for (i, col) in profile.columns.iter().enumerate() {
+        let edit_penalty = edit_penalty.at(profile.edit_site(i));
         for (forward, backward) in hyps {
             let mut best = NEG_INF;
             let readings = forward.iter().chain(backward.iter().filter(|_| reverse));
@@ -1045,7 +1047,7 @@ mod tests {
                 col
             })
             .collect();
-        Profile { gene: gene.to_string(), columns }
+        Profile { gene: gene.to_string(), columns, edited: None }
     }
 
     #[test]
@@ -1284,7 +1286,7 @@ mod tests {
     fn reverse_editing_dp_matches_the_reference_implementation() {
         // the score table and the per-codon enumeration must agree with
         // U->C readings in play too, in one pass and in two
-        let costs = EditCosts { c_to_u: 2.5, u_to_c: 3.0, u_to_c_stop: 2.0 };
+        let costs = EditCosts { c_to_u: 2.5, u_to_c: 3.0, u_to_c_stop: 2.0, c_to_u_known: 2.5, c_to_u_novel: 2.5 };
         let mut rng = Lcg(11);
         let mut n_rev = 0;
         for trial in 0..200 {

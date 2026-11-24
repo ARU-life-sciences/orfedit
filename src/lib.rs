@@ -93,7 +93,13 @@ pub const FRAMESHIFT_MIN_GAIN: f64 = 0.0;
 impl ScanParams {
     /// The edit costs these parameters ask for.
     pub fn edit_costs(&self) -> codon::EditCosts {
-        codon::EditCosts { c_to_u: self.edit_penalty, u_to_c: self.reverse_edit_penalty, u_to_c_stop: self.stop_edit_penalty }
+        codon::EditCosts {
+            c_to_u: self.edit_penalty,
+            u_to_c: self.reverse_edit_penalty,
+            u_to_c_stop: self.stop_edit_penalty,
+            c_to_u_known: self.known_edit_penalty.unwrap_or(self.edit_penalty),
+            c_to_u_novel: self.novel_edit_penalty.unwrap_or(self.edit_penalty),
+        }
     }
 }
 
@@ -159,6 +165,13 @@ pub struct ScanParams {
     /// none. Kept apart from `reverse_edit_penalty` because a stop inside
     /// a gene is far stronger evidence of an edit than any other T.
     pub stop_edit_penalty: f64,
+    /// For a profile that says where its reference proteins are edited
+    /// (its `edit` column): the cost of a C->U edit at a column edited in
+    /// them, and at one that is not. `None` (the default) for
+    /// `edit_penalty`, which is also the cost at every column of a profile
+    /// without that column.
+    pub known_edit_penalty: Option<f64>,
+    pub novel_edit_penalty: Option<f64>,
 }
 
 impl Default for ScanParams {
@@ -176,6 +189,8 @@ impl Default for ScanParams {
             stop_search: 0,
             reverse_edit_penalty: f64::INFINITY,
             stop_edit_penalty: f64::INFINITY,
+            known_edit_penalty: None,
+            novel_edit_penalty: None,
         }
     }
 }
@@ -350,7 +365,7 @@ mod tests {
             col[idx] = 5.0;
             columns.push(col);
         }
-        Profile { gene: "test".to_string(), columns }
+        Profile { gene: "test".to_string(), columns, edited: None }
     }
 
     fn fasta_with(contig: &str, seq: &str) -> FastaIndex {
@@ -430,7 +445,35 @@ mod tests {
             col[AA_ORDER.iter().position(|&x| x == target).unwrap()] = 5.0;
             columns.push(col);
         }
-        Profile { gene: "test".to_string(), columns }
+        Profile { gene: "test".to_string(), columns, edited: None }
+    }
+
+    #[test]
+    fn an_edit_at_a_column_the_references_do_not_edit_costs_more() {
+        // profile M L K L F; the genome has Ser (TCA) at both Leu columns
+        let mut profile = one_residue_profile(b"MLKLF");
+        let idx = fasta_with("ctg", "GGGATGTCAAAATCATTTTAAGGG");
+        let params = ScanParams { flank: 3, ..ScanParams::default() };
+        let out = scan_gene(&idx, "ctg", 3, 18, '+', &profile, &params).unwrap();
+        assert_eq!((out.protein.as_str(), out.edits.len()), ("MLKLF", 2));
+        // the profile says its references are edited at the first Leu only: without
+        // separate costs that changes nothing
+        profile.edited = Some(vec![false, true, false, false, false]);
+        let out = scan_gene(&idx, "ctg", 3, 18, '+', &profile, &params).unwrap();
+        assert_eq!((out.protein.as_str(), out.edits.len()), ("MLKLF", 2));
+        // with one for the other columns, the edit at the other Leu is no longer worth its cost
+        let params = ScanParams { novel_edit_penalty: Some(20.0), ..params };
+        let out = scan_gene(&idx, "ctg", 3, 18, '+', &profile, &params).unwrap();
+        assert_eq!((out.protein.as_str(), out.edits.len()), ("MLKSF", 1));
+        assert_eq!((out.edits[0].genomic_pos, out.edits[0].profile_column, out.edits[0].resulting_aa), (7, 1, 'L'));
+        // an edit too dear at the plain cost is still made at a known column, at its own cost
+        let params = ScanParams { edit_penalty: 20.0, known_edit_penalty: Some(1.0), novel_edit_penalty: None, ..params };
+        let out = scan_gene(&idx, "ctg", 3, 18, '+', &profile, &params).unwrap();
+        assert_eq!((out.protein.as_str(), out.edits.len()), ("MLKSF", 1));
+        // and a profile that does not say takes the plain cost everywhere
+        profile.edited = None;
+        let out = scan_gene(&idx, "ctg", 3, 18, '+', &profile, &params).unwrap();
+        assert_eq!((out.protein.as_str(), out.edits.len()), ("MSKSF", 0));
     }
 
     #[test]
@@ -471,7 +514,7 @@ mod tests {
             col[AA_ORDER.iter().position(|x| x == target).unwrap()] = 5.0;
             columns.push(col);
         }
-        let profile = Profile { gene: "t".into(), columns };
+        let profile = Profile { gene: "t".into(), columns, edited: None };
         let params = ScanParams { flank: 0, frameshift_penalty: 10.0, ..ScanParams::default() };
         let out = scan_gene(&fasta_with("c", &fwd), "c", 0, fwd.len() as i64, '+', &profile, &params).unwrap();
         assert_eq!(out.frameshifts.len(), 1);
@@ -501,7 +544,7 @@ mod tests {
             col[AA_ORDER.iter().position(|x| x == target).unwrap()] = 5.0;
             cols.push(col);
         }
-        let p10 = Profile { gene: "t".into(), columns: cols };
+        let p10 = Profile { gene: "t".into(), columns: cols, edited: None };
         let out = scan_gene(&fasta_with("c", short), "c", 0, short.len() as i64, '+', &p10, &params).unwrap();
         assert!(out.frameshifts.is_empty());
     }

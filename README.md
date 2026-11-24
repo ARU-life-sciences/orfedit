@@ -174,6 +174,35 @@ With either option off the output is what it was (every table for 90,102
 DToL gene copies unchanged). The edits table has an `edit` column, `C>U`
 or `U>C`.
 
+## Editing sites
+
+A profile built from RNA-edited proteins can say where they are edited: a
+21st column, `edit`, holding for each profile column the share of its
+reference proteins whose residue there an edit made (0: none). Without
+it, a C-to-U edit costs `--edit-penalty` at every column, and wherever a
+species has a residue of its own that a C-to-U would turn into the
+profile's, an edit is called: in fast-evolving genes (plastid rpoC2,
+matK) most calls were of that kind. With it, two more costs apply to
+that profile, each `--edit-penalty` unless given:
+
+- `--known-edit-penalty`: a C-to-U edit at a column edited in the
+  references.
+- `--novel-edit-penalty`: one at any other column.
+
+Measured on 107 DToL angiosperms with RNA-seq, each annotated with
+profiles built without its own genus: at 2.5 everywhere, 40% of the
+edits called in single-exon plastid genes and 93% of those in
+mitochondrial ones were in the RNA. With 10 at the other columns and 1.5
+at the known ones, 94% and 97% are, with more correct plastid calls
+than before (1,494 against 1,444) and 9% more mitochondrial ones, which
+find 77% of the C-to-U sites the reads show, from 71%.
+
+The profile's builder decides what counts as a site; poa asks for the
+edit in two genera, since RNA-seq from another plant than the assembly
+shows the differences between the two as edits. Stop codons made by an
+edit are not columns and keep `--edit-penalty`. A profile without the
+column is read as before, and the output is unchanged for it.
+
 ## Output (`scan-batch`)
 
 `<gene-calls-out>`: one row per manifest row - `raw_start`/`raw_end` (echoed
@@ -203,7 +232,9 @@ order, one column per code, exactly once each), then one row per profile
 scoring scheme - `orfedit` just sums them, it doesn't care how they were
 derived). See `plant_organellar_database`'s
 `analysis/editing/src/00_build_reference_profiles.py` for how these are
-built from that dataset's own annotated orthologs.
+built from that dataset's own annotated orthologs. A 21st column headed
+`edit` is optional (see Editing sites): a number per profile column, above
+0 where the reference proteins are edited.
 
 ## Usage
 

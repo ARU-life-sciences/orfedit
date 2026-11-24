@@ -52,6 +52,14 @@ enum Command {
         /// Arg, by a U-to-C edit. `inf`, the default: a stop is a stop
         #[arg(long, default_value_t = f64::INFINITY)]
         stop_edit_penalty: f64,
+        /// For a profile that says where its reference proteins are edited
+        /// (a 21st `edit` column): the cost of a C-to-U edit at a column
+        /// edited in them. Default: --edit-penalty
+        #[arg(long)]
+        known_edit_penalty: Option<f64>,
+        /// ...and at a column that is not. Default: --edit-penalty
+        #[arg(long)]
+        novel_edit_penalty: Option<f64>,
         #[arg(long, default_value_t = 300)]
         flank: i64,
         /// Cost of a frame change (skipping 1 or 2 bases) inside a gene;
@@ -159,6 +167,8 @@ fn main() -> Result<()> {
             edit_penalty,
             reverse_edit_penalty,
             stop_edit_penalty,
+            known_edit_penalty,
+            novel_edit_penalty,
             flank,
             frameshift_penalty,
             frameshift_flank,
@@ -199,6 +209,8 @@ fn main() -> Result<()> {
                 edit_penalty,
                 reverse_edit_penalty,
                 stop_edit_penalty,
+                known_edit_penalty,
+                novel_edit_penalty,
                 flank,
                 frameshift_penalty,
                 frameshift_flank,

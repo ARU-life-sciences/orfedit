@@ -84,9 +84,32 @@ pub struct EditCosts {
     pub c_to_u: f64,
     pub u_to_c: f64,
     pub u_to_c_stop: f64,
+    /// Costs of a C->U edit at a column of a profile that says where its
+    /// reference proteins are edited (`Profile::edited`): at a column
+    /// edited in them, and at one that is not. Both the same as `c_to_u`
+    /// unless set apart; `c_to_u` is the cost at every column of a profile
+    /// that does not say. Where a profile's proteins are RNA-edited ones,
+    /// the columns their editing touches are known, and a C->U anywhere
+    /// else is far more often a residue the species simply differs in: of
+    /// the edits called in the plastid genes of 89 angiosperms at one flat
+    /// cost, 42% were in their RNA; with a cost of 10 away from the known
+    /// columns, 95%.
+    pub c_to_u_known: f64,
+    pub c_to_u_novel: f64,
 }
 
 impl EditCosts {
+    /// These costs at a profile column: `site` is whether the references
+    /// are edited there (`Profile::edit_site`), `None` for a profile that
+    /// does not say, which leaves the plain cost.
+    #[inline]
+    pub fn at(self, site: Option<bool>) -> Self {
+        match site {
+            None => self,
+            Some(true) => EditCosts { c_to_u: self.c_to_u_known, ..self },
+            Some(false) => EditCosts { c_to_u: self.c_to_u_novel, ..self },
+        }
+    }
     /// Whether any reverse reading is allowed at all.
     pub fn reverse(&self) -> bool {
         self.u_to_c.is_finite() || self.u_to_c_stop.is_finite()
@@ -109,7 +132,7 @@ impl EditCosts {
 
 impl From<f64> for EditCosts {
     fn from(c_to_u: f64) -> Self {
-        EditCosts { c_to_u, u_to_c: f64::INFINITY, u_to_c_stop: f64::INFINITY }
+        EditCosts { c_to_u, u_to_c: f64::INFINITY, u_to_c_stop: f64::INFINITY, c_to_u_known: c_to_u, c_to_u_novel: c_to_u }
     }
 }
 
@@ -228,12 +251,18 @@ mod tests {
         assert!(!costs.reverse());
         assert_eq!(costs.cost(2, 0, 0), 5.0);
         assert!(costs.cost(0, 0, 1).is_infinite() && costs.cost(0, 1, 0).is_infinite());
-        let both = EditCosts { c_to_u: 2.5, u_to_c: 8.0, u_to_c_stop: 3.0 };
+        let both = EditCosts { c_to_u: 2.5, u_to_c: 8.0, u_to_c_stop: 3.0, c_to_u_known: 2.5, c_to_u_novel: 2.5 };
         assert!(both.reverse());
         assert_eq!(both.cost(1, 2, 0), 18.5);
         assert_eq!(both.cost(0, 0, 1), 3.0);
         // stops only: an ordinary reverse edit stays ruled out
-        let stops = EditCosts { c_to_u: 2.5, u_to_c: f64::INFINITY, u_to_c_stop: 3.0 };
+        let stops = EditCosts { c_to_u: 2.5, u_to_c: f64::INFINITY, u_to_c_stop: 3.0, c_to_u_known: 2.5, c_to_u_novel: 2.5 };
+        // a profile that says where its references are edited: one cost for a C->U at such a
+        // column, another elsewhere; nothing else changes, and nothing at all without the say
+        let apart = EditCosts { c_to_u: 2.5, u_to_c: 8.0, u_to_c_stop: 3.0, c_to_u_known: 1.0, c_to_u_novel: 9.0 };
+        assert_eq!(apart.at(None).cost(1, 1, 0), 10.5);
+        assert_eq!(apart.at(Some(true)).cost(1, 1, 0), 9.0);
+        assert_eq!(apart.at(Some(false)).cost(1, 1, 0), 17.0);
         assert!(stops.reverse());
         assert!(stops.cost(0, 1, 0).is_infinite());
         assert_eq!(stops.cost(0, 0, 1), 3.0);
