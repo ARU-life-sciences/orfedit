@@ -105,6 +105,14 @@ enum Command {
         /// (0: kept anywhere)
         #[arg(long, default_value_t = 25)]
         end_margin: usize,
+        /// Genes (comma-separated; the manifest's gene name before any
+        /// '|', or the profile's file name without .pssm) that start at the
+        /// most upstream ATG of their open reading frame, unless they
+        /// start at an ACG: for an N-terminal extension too variable to
+        /// align, annotated from the frame's first ATG (angiosperm mito
+        /// atp6). Looks up to 300 codons upstream
+        #[arg(long, value_delimiter = ',')]
+        upstream_start: Vec<String>,
     },
 }
 
@@ -200,6 +208,7 @@ fn main() -> Result<()> {
             start_search,
             internal_stop_penalty,
             end_margin,
+            upstream_start,
         } => {
             rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().ok();
 
@@ -245,6 +254,14 @@ fn main() -> Result<()> {
                 start_search,
                 internal_stop_penalty,
                 end_margin,
+                upstream_start: false,
+            };
+            // the genes started at the most upstream ATG of their frame
+            let upstream_genes: Vec<String> = upstream_start.iter().map(|g| g.to_lowercase()).collect();
+            let upstream_for = |r: &ManifestRow| {
+                let name = r.gene.split('|').next().unwrap_or("").to_lowercase();
+                let stem = std::path::Path::new(&r.profile).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+                upstream_genes.iter().any(|g| *g == name || *g == stem)
             };
 
             let group_vec: Vec<(&String, &Vec<&ManifestRow>)> = groups.iter().collect();
@@ -264,7 +281,8 @@ fn main() -> Result<()> {
                             Some(p) => p,
                             None => continue, // already warned above
                         };
-                        match scan_gene(&idx, &r.contig, r.start, r.end, r.strand, profile, &params) {
+                        let row_params = ScanParams { upstream_start: upstream_for(r), ..params };
+                        match scan_gene(&idx, &r.contig, r.start, r.end, r.strand, profile, &row_params) {
                             Ok(outcome) => {
                                 // "changed" = editing was actually invoked, not "coordinates differ at
                                 // all" - a profile-alignment boundary almost never lands on the exact

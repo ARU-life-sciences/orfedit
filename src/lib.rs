@@ -205,6 +205,15 @@ pub struct ScanParams {
     /// without that column.
     pub known_edit_penalty: Option<f64>,
     pub novel_edit_penalty: Option<f64>,
+    /// Start the gene at the most upstream ATG of its open reading frame
+    /// (up to UPSTREAM_START_MAX codons before the aligned start, with no
+    /// stop between), unless the first aligned codon is ACG, a start an
+    /// edit makes. For a gene whose N-terminal extension is not conserved
+    /// enough to align and is annotated from the first ATG of the frame:
+    /// angiosperm mito atp6, whose presequence runs 18 to 146 codons
+    /// before the conserved part. Where there is no ATG upstream, the
+    /// usual rule (`start_search`). See `move_start`.
+    pub upstream_start: bool,
 }
 
 impl Default for ScanParams {
@@ -227,9 +236,14 @@ impl Default for ScanParams {
             stop_edit_penalty: f64::INFINITY,
             known_edit_penalty: None,
             novel_edit_penalty: None,
+            upstream_start: false,
         }
     }
 }
+
+/// How far (codons) before the aligned start `ScanParams::upstream_start`
+/// follows the open reading frame.
+pub const UPSTREAM_START_MAX: usize = 300;
 
 /// How many times `scan_gene` looks again in a longer window when the
 /// gene runs out of the one it has.
@@ -412,6 +426,50 @@ fn move_start(profile: &Profile, sense_seq: &[u8], params: &ScanParams, result: 
     result.sense_span = Some((p, end));
 }
 
+/// The 5' end (genomic: a start on '+', an end on '-') of the most upstream
+/// ATG of the open reading frame of a gene whose aligned start is at `g`,
+/// up to UPSTREAM_START_MAX codons before it with no stop between; None if
+/// the aligned start is an ACG (a start an edit makes) or there is no ATG
+/// upstream (`ScanParams::upstream_start`). Read from the contig itself, not
+/// the alignment's window, so the alignment is as without it. On 19 RefSeq
+/// angiosperm mitogenomes, 7 of the 11 atp6 starts poa missed were annotated
+/// there, 18 to 138 codons before the aligned start; the 8 it had right
+/// began at an ACG (5) or had no ATG upstream (3).
+fn upstream_start(fasta_idx: &FastaIndex, contig: &str, strand: char, g: usize) -> Option<usize> {
+    let seq = fasta_idx.sequences.get(contig)?;
+    // the codon whose 5' end is k codons upstream of g, in the gene's sense
+    let codon = |k: usize| -> Option<[u8; 3]> {
+        if strand == '-' {
+            // genomic [g + 3k - 3, g + 3k), read as its reverse complement
+            let e = g + 3 * k;
+            (e >= 3 && e <= seq.len()).then(|| {
+                let mut c = [seq[e - 1], seq[e - 2], seq[e - 3]];
+                for b in c.iter_mut() {
+                    *b = match *b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x };
+                }
+                c
+            })
+        } else {
+            let s = g.checked_sub(3 * k)?;
+            (s + 3 <= seq.len()).then(|| [seq[s], seq[s + 1], seq[s + 2]])
+        }
+    };
+    if codon(0)? == *b"ACG" {
+        return None;
+    }
+    let mut most = None;
+    for k in 1..=UPSTREAM_START_MAX {
+        let Some(c) = codon(k) else { break };
+        if codon::translate_codon(c) == codon::STOP || c.iter().any(|b| !b"ACGT".contains(b)) {
+            break;
+        }
+        if c == *b"ATG" {
+            most = Some(k);
+        }
+    }
+    most.map(|k| if strand == '-' { g + 3 * k } else { g - 3 * k })
+}
+
 /// Scan one (species, gene) anchor: extract a flanked genomic window around
 /// `anchor_start`/`anchor_end` (0-based half-open, the existing `.ctg.bed`
 /// call), try all 3 reading frames against `profile`, and return the
@@ -429,6 +487,7 @@ pub fn scan_gene(
 ) -> Result<ScanOutcome> {
     // genomic context taken before the anchor's start and after its end
     let (mut before, mut after) = (params.flank, params.flank);
+
     let mut window = fasta_idx.extract_window(contig, anchor_start - before, anchor_end + after, strand)?;
     let (mut result, mut near_ends) = align_window(profile, &window.2, params);
     for _ in 0..MAX_WIDENINGS {
@@ -452,13 +511,23 @@ pub fn scan_gene(
         (result, near_ends) = align_window(profile, &window.2, params);
     }
     let (window_start, window_end, sense_seq) = window;
-    move_start(profile, &sense_seq, params, &mut result);
+    // the gene's 5' end where the profile aligns, on the genome
+    let aligned_5p = result.sense_span.map(|(s0, _)| if strand == '-' { window_end - s0 } else { window_start + s0 });
+    let upstream = if params.upstream_start { aligned_5p.and_then(|g| upstream_start(fasta_idx, contig, strand, g)) } else { None };
+    if upstream.is_none() {
+        move_start(profile, &sense_seq, params, &mut result);
+    }
     let frame = result.sense_span.map_or(0, |(s, _)| s % 3);
 
     let (mut corrected_start, mut corrected_end) = match result.sense_span {
         Some((s, e)) => sense_span_to_genomic(window_start, window_end, strand, s, e),
         None => (anchor_start.max(0) as usize, anchor_end.max(0) as usize),
     };
+    // (the frame's first ATG may lie beyond the window: the alignment is
+    // left as it was, and only the gene's 5' end moves)
+    if let Some(g) = upstream {
+        if strand == '-' { corrected_end = g } else { corrected_start = g }
+    }
 
     let mut protein = String::with_capacity(result.columns.len());
     let mut edits = Vec::new();
@@ -734,6 +803,44 @@ mod tests {
         let idx = fasta_with("ctg", &seq);
         let out = scan_gene(&idx, "ctg", 0, seq.len() as i64, '+', &profile, &ScanParams { end_margin: 6, ..params }).unwrap();
         assert_eq!((out.n_internal_stops, out.corrected_start, out.corrected_end), (0, 21, 114));
+    }
+
+    #[test]
+    fn a_gene_with_an_unaligned_extension_starts_at_the_first_atg_of_its_frame() {
+        // the profile is K V W F E Y; upstream of the K, in an open frame
+        // after a stop, ATGs at 6 and 24 (as angiosperm atp6's presequence)
+        let profile = profile_of(b"KVWFEY");
+        let seq = format!("CCCTAAATG{}ATG{}AAAGTTTGGTTTGAATATTAG", "GGC".repeat(5), "GGC".repeat(3));
+        let idx = fasta_with("ctg", &seq);
+        let params = ScanParams { flank: 0, stop_search: 10, start_search: 10, ..ScanParams::default() };
+        let n = seq.len() as i64;
+        // the usual rule, given the whole sequence: the nearest ATG, four codons up
+        let out = scan_gene(&idx, "ctg", 0, n, '+', &profile, &params).unwrap();
+        assert_eq!(out.corrected_start, 24);
+        // and from an anchor at 30 with no flank, nothing upstream to see
+        let out = scan_gene(&idx, "ctg", 30, n, '+', &profile, &params).unwrap();
+        assert_eq!(out.corrected_start, 36);
+        // upstream_start: the frame's first ATG, after its stop, though the
+        // anchor (and the usual window) starts at 30
+        let up = ScanParams { upstream_start: true, ..params };
+        let out = scan_gene(&idx, "ctg", 30, n, '+', &profile, &up).unwrap();
+        assert_eq!((out.corrected_start, out.corrected_end), (6, seq.len()));
+        assert_eq!(out.protein, "KVWFEY");
+        // and on the minus strand, upstream is to the right
+        let rc = revcomp(&seq);
+        let out = scan_gene(&fasta_with("ctg", &rc), "ctg", 0, n - 30, '-', &profile, &up).unwrap();
+        assert_eq!((out.corrected_start, out.corrected_end), (0, seq.len() - 6));
+        // a gene starting at an ACG keeps it
+        let profile = profile_of(b"TKVWFEY");
+        let seq = "CCCTAAATGGGCACGAAAGTTTGGTTTGAATATTAG";
+        let out = scan_gene(&fasta_with("ctg", seq), "ctg", 0, seq.len() as i64, '+', &profile, &up).unwrap();
+        assert_eq!(out.corrected_start, 12);
+        // no ATG upstream: the usual rule
+        let profile = profile_of(b"KVWFEY");
+        let seq = "CCCTAAGGCGGCAAAGTTTGGTTTGAATATTAG";
+        let a = scan_gene(&fasta_with("ctg", seq), "ctg", 0, seq.len() as i64, '+', &profile, &up).unwrap();
+        let b = scan_gene(&fasta_with("ctg", seq), "ctg", 0, seq.len() as i64, '+', &profile, &params).unwrap();
+        assert_eq!(a.corrected_start, b.corrected_start);
     }
 
     #[test]

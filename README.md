@@ -157,7 +157,8 @@ both, the start is left alone.
 
 On the single-exon genes of 19 RefSeq angiosperm mitogenomes and 13
 RefSeq plastomes, starts within 3 bp of the annotated ones went from 384
-to 401 of 457 (mito) and from 528 to 574 of 626 (plastid), with one
+to 401 of 457 (mito) and from 528 to 574 of 626 (plastid; 564 to 613 of
+671 counting the Pinus plastome, which the harness had left out), with one
 start that was right made wrong (Arabidopsis ccmFn2, annotated at a GTG
 six codons from an ATG). At 5, 15, 20 and 30 codons: 393/559, 407/576,
 409/577 and 409/576, with 1, 6, 8 and 9 made wrong - genes annotated
@@ -165,6 +166,23 @@ with another start codon (TTG, GTG, ATT, ATA) and an ATG near them.
 What is left is mostly genes whose annotated start lies far from the
 conserved part (atp6 has N-terminal extensions of 18 to 146 codons in
 these genomes) or differs between records (rps4, mttB, rpl16).
+
+`--upstream-start GENES` (0.2.1; comma-separated, matched to the
+manifest's gene name before any `|` or to the profile's file name) is
+for such a gene: one whose N-terminal extension is too variable to align
+and is annotated from the first ATG of its open reading frame. It starts
+at the most upstream ATG of the frame, up to 300 codons before the
+aligned start with no stop between, unless the gene starts at an ACG (a
+start an edit makes); with no ATG upstream, `--start-search` applies as
+usual. The frame is followed in the contig after the gene is aligned, so
+the alignment, its score, edits and frame changes, and the gene's end
+are as without the option; only its start moves. With `--upstream-start
+atp6` on the same 19 mitogenomes, atp6 starts within 3 bp went from 8 to
+14 of 19 and mito starts from 401 to 407 of 457, none made wrong; of the
+five atp6 still wrong, four now start further upstream than RefSeq does,
+and one at an ACG that RefSeq starts after. Over 1,785 atp6 copies in 836
+DToL angiosperm mitogenomes, 861 start further upstream (median 87
+codons, 90% within 179), and nothing else about them changes.
 
 ## Where a gene ends
 
